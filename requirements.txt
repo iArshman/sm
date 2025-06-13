@@ -1,6 +1,4 @@
-aiogram
+aiogram==2.25.2
 pymongo
 motor
 paramiko
-psutil
-distro
