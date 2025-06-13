@@ -17,8 +17,8 @@ from telegram.ext import (
 )
 from db import db
 from config import BOT_TOKEN
-from file import setup_file_handlers  # Import from separate file.py
-from botmanager import setup_bot_handlers  # Import from separate botmanager.py
+from file import setup_handlers  # Import from separate file.py
+from botmanager import setup_handlers  # Import from separate botmanager.py
 
 # --- Setup ---
 logging.basicConfig(
