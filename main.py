@@ -1,22 +1,3 @@
-
-
-# file.py
-# Placeholder for File Manager
-from aiogram.types import Message
-
-async def handle_file_manager(message: Message, server_data):
-    await message.answer("📂 File Manager: Coming Soon")
-
-
-# botmanager.py
-# Placeholder for Bot Manager
-from aiogram.types import Message
-
-async def handle_bot_manager(message: Message, server_data):
-    await message.answer("🤖 Bot Manager: Coming Soon")
-
-
-# main.py
 import os
 import asyncio
 import paramiko
