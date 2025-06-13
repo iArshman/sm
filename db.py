@@ -1,45 +1,30 @@
 from pymongo import MongoClient
 from config import MONGO_URI
-import paramiko
-from io import StringIO
-import threading
 
-class Database:
-    def __init__(self):
-        self.client = MongoClient(MONGO_URI)
-        self.db = self.client.serverbot
-        self.connection_cache = {}
-        self.lock = threading.Lock()
-        
-    def get_ssh(self, server):
-        """Get cached SSH connection or create new one"""
-        server_id = str(server['_id'])
-        
-        with self.lock:
-            if server_id in self.connection_cache:
-                ssh, last_used = self.connection_cache[server_id]
-                if time.time() - last_used < 30:  # Reuse if recent
-                    return ssh
-            
-            # Create new connection
-            try:
-                key_file = StringIO()
-                key_file.write(server['ssh_key'])
-                key_file.seek(0)
-                
-                ssh = paramiko.SSHClient()
-                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                ssh.connect(
-                    hostname=server['ip'],
-                    username=server['username'],
-                    pkey=paramiko.RSAKey.from_private_key(key_file),
-                    timeout=SSH_TIMEOUT,
-                    banner_timeout=10
-                )
-                
-                self.connection_cache[server_id] = (ssh, time.time())
-                return ssh
-            except Exception as e:
-                raise Exception(f"SSH failed: {str(e)}")
+client = MongoClient(MONGO_URI)
+db = client['server_manager']
+servers = db['servers']
 
-db = Database()
+def add_server(user_id, name, username, ip, key_file_path):
+    servers.insert_one({
+        'user_id': user_id,
+        'name': name,
+        'username': username,
+        'ip': ip,
+        'key_file_path': key_file_path
+    })
+
+def get_servers(user_id):
+    return list(servers.find({'user_id': user_id}))
+
+def get_server_by_name(user_id, name):
+    return servers.find_one({'user_id': user_id, 'name': name})
+
+def update_server_name(user_id, old_name, new_name):
+    servers.update_one({'user_id': user_id, 'name': old_name}, {'$set': {'name': new_name}})
+
+def update_server_username(user_id, name, new_username):
+    servers.update_one({'user_id': user_id, 'name': name}, {'$set': {'username': new_username}})
+
+def delete_server(user_id, name):
+    servers.delete_one({'user_id': user_id, 'name': name})
