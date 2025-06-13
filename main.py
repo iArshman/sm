@@ -1,142 +1,167 @@
+# main.py
+
 import logging
-import asyncio
+import os
 import platform
 import paramiko
 import psutil
-import socket
-import time
-from aiogram import Bot, Dispatcher, executor, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from config import BOT_TOKEN, ADMIN_IDS
+import uptime
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.utils import executor
+from config import BOT_TOKEN
 from db import (
-    add_server, get_servers, get_server_by_id,
-    update_server_name, update_server_username, delete_server_by_id
+    add_server,
+    get_servers,
+    get_server_by_id,
+    update_server_name,
+    update_server_username,
+    delete_server_by_id
 )
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher(bot)
 logging.basicConfig(level=logging.INFO)
 
-# Util
-async def is_ssh_accessible(ip, username, pkey_str):
-    try:
-        key = paramiko.RSAKey.from_private_key_file(pkey_str)
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip, username=username, pkey=key, timeout=5)
-        ssh.close()
-        return True
-    except Exception as e:
-        return False
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
 
-# Start Command
+# --- UTILS ---
+
+def cancel_button():
+    return InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Cancel", callback_data="cancel"))
+
+def back_button(to):
+    return InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=to))
+
+# --- TEMP STATE ---
+user_input = {}
+
+# --- START ---
 @dp.message_handler(commands=['start'])
-async def start_cmd(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return await message.answer("Access denied.")
-    await show_main_menu(message)
-
-async def show_main_menu(message_or_callback):
-    servers = get_servers()
-    kb = InlineKeyboardMarkup(row_width=2)
-    for s in servers:
-        kb.add(InlineKeyboardButton(f"🖥️ {s['name']}", callback_data=f"server:{s['_id']}"))
+async def start(message: types.Message):
+    servers = await get_servers()
+    kb = InlineKeyboardMarkup(row_width=1)
+    for server in servers:
+        kb.add(InlineKeyboardButton(f"🖥 {server['name']}", callback_data=f"server_{server['_id']}"))
     kb.add(InlineKeyboardButton("➕ Add Server", callback_data="add_server"))
+    await message.answer("🔧 <b>Multi Server Manager</b>", parse_mode='HTML', reply_markup=kb)
 
-    text = "<b>🌐 Server Manager</b>\nSelect a server to manage:"
-    if isinstance(message_or_callback, types.CallbackQuery):
-        await message_or_callback.message.edit_text(text, reply_markup=kb)
-    else:
-        await message_or_callback.answer(text, reply_markup=kb)
+# --- CANCEL HANDLER ---
+@dp.callback_query_handler(lambda c: c.data == "cancel")
+async def cancel_action(callback: types.CallbackQuery):
+    user_input.pop(callback.from_user.id, None)
+    await callback.message.delete()
+    await start(callback.message)
 
-# Add Server Flow
-user_state = {}
-
+# --- ADD SERVER ---
 @dp.callback_query_handler(lambda c: c.data == "add_server")
-async def handle_add_server(callback: types.CallbackQuery):
-    user_state[callback.from_user.id] = {'step': 'name'}
-    await callback.message.edit_text("📝 Enter server name:\n\n❌ /cancel to abort")
+async def add_server_start(callback: types.CallbackQuery):
+    user_input[callback.from_user.id] = {}
+    await bot.send_message(callback.from_user.id, "📝 Enter server name:", reply_markup=cancel_button())
+    user_input[callback.from_user.id]['step'] = 'name'
 
-@dp.message_handler(lambda m: m.from_user.id in user_state)
-async def collect_server_info(message: types.Message):
+@dp.message_handler()
+async def handle_inputs(message: types.Message):
     uid = message.from_user.id
-    state = user_state.get(uid, {})
-    step = state.get('step')
-
-    if message.text == "/cancel":
-        user_state.pop(uid, None)
-        return await message.answer("❌ Cancelled.", reply_markup=types.ReplyKeyboardRemove())
+    if uid not in user_input or 'step' not in user_input[uid]:
+        return
+    step = user_input[uid]['step']
 
     if step == 'name':
-        state['name'] = message.text
-        state['step'] = 'username'
-        await message.answer("👤 Enter SSH username:")
+        user_input[uid]['name'] = message.text
+        user_input[uid]['step'] = 'username'
+        await message.answer("👤 Enter username:", reply_markup=cancel_button())
+
     elif step == 'username':
-        state['username'] = message.text
-        state['step'] = 'ip'
-        await message.answer("📡 Enter server IP address:")
+        user_input[uid]['username'] = message.text
+        user_input[uid]['step'] = 'ip'
+        await message.answer("🌐 Enter IP address:", reply_markup=cancel_button())
+
     elif step == 'ip':
-        state['ip'] = message.text
-        state['step'] = 'pkey'
-        await message.answer("📎 Send the private key file (.pem):")
-    else:
-        await message.answer("❌ Unexpected step. Send /cancel to restart.")
+        user_input[uid]['ip'] = message.text
+        user_input[uid]['step'] = 'key'
+        await message.answer("🔑 Send SSH private key file:", reply_markup=cancel_button())
 
 @dp.message_handler(content_types=types.ContentType.DOCUMENT)
-async def handle_pkey_file(message: types.Message):
+async def handle_key_upload(message: types.Message):
     uid = message.from_user.id
-    state = user_state.get(uid)
-    if not state or state.get('step') != 'pkey':
+    if uid not in user_input or user_input[uid].get('step') != 'key':
         return
 
-    doc = message.document
-    if not doc.file_name.endswith(".pem"):
-        return await message.answer("❌ Invalid file. Must be .pem format.")
+    file = await bot.download_file_by_id(message.document.file_id)
+    key_path = f"/tmp/{message.document.file_name}"
+    with open(key_path, "wb") as f:
+        f.write(file.read())
 
-    file_path = f"/tmp/{doc.file_name}"
-    await doc.download(destination_file=file_path)
+    data = user_input[uid]
+    await message.answer("🔌 Connecting to server...")
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    await message.answer("⏳ Testing SSH connection...")
-    access = await is_ssh_accessible(state['ip'], state['username'], file_path)
+    try:
+        ssh.connect(data['ip'], username=data['username'], key_filename=key_path, timeout=10)
+        ssh.close()
+        await add_server(data['name'], data['username'], data['ip'], key_path)
+        await message.answer("✅ Server added successfully!")
+    except Exception as e:
+        await message.answer(f"❌ SSH connection failed: {e}")
 
-    if not access:
-        return await message.answer("❌ SSH login failed. Check key/IP/username and try again.")
+    user_input.pop(uid, None)
+    await start(message)
 
-    add_server({
-        'name': state['name'],
-        'username': state['username'],
-        'ip': state['ip'],
-        'pkey': file_path
-    })
-    user_state.pop(uid, None)
-    await message.answer("✅ Server added successfully!")
-    await show_main_menu(message)
-
-# Server Selected
-@dp.callback_query_handler(lambda c: c.data.startswith("server:"))
-async def handle_server_selected(callback: types.CallbackQuery):
-    sid = callback.data.split(":")[1]
-    server = get_server_by_id(sid)
+# --- SERVER MENU ---
+@dp.callback_query_handler(lambda c: c.data.startswith("server_"))
+async def view_server(callback: types.CallbackQuery):
+    server_id = callback.data.split("_")[1]
+    server = await get_server_by_id(server_id)
     if not server:
-        return await callback.message.edit_text("❌ Server not found.")
-
-    # Simulate info
-    info = f"🖥️ <b>Server Info: {server['name']}</b>\n\n"
-    info += f"👤 <b>User:</b> {server['username']}\n"
-    info += f"📡 <b>IP:</b> {server['ip']}\n"
-    info += f"💻 <b>OS:</b> Ubuntu 22.04 LTS\n"
-    info += f"⏱️ <b>Uptime:</b> 3 days, 5 hours\n\n"
-    info += f"📊 <b>Resources:</b>\n🔋 RAM: 8 GB | 3.2 GB used\n💽 Disk: 100 GB | 55 GB used\n🧠 CPU: 18%\n"
+        await callback.message.edit_text("❌ Server not found.")
+        return
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("🗂️ File Manager", callback_data=f"file:{sid}"),
-        InlineKeyboardButton("🤖 Bot Manager", callback_data=f"bot:{sid}")
+        InlineKeyboardButton("🗂 File Manager", callback_data=f"file_{server_id}"),
+        InlineKeyboardButton("📊 Server Info", callback_data=f"info_{server_id}"),
+        InlineKeyboardButton("🤖 Bot Manager", callback_data=f"bot_{server_id}"),
+        InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{server_id}"),
     )
-    kb.add(InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{sid}"))
-    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="back"))
+    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="start"))
+    await callback.message.edit_text(f"🖥 <b>{server['name']}</b>", parse_mode='HTML', reply_markup=kb)
 
-    await callback.message.edit_text(info, reply_markup=kb)
+# --- SERVER INFO ---
+@dp.callback_query_handler(lambda c: c.data.startswith("info_"))
+async def server_info(callback: types.CallbackQuery):
+    server_id = callback.data.split("_")[1]
+    server = await get_server_by_id(server_id)
+    if not server:
+        await callback.message.edit_text("❌ Server not found.")
+        return
+
+    text = (
+        f"🖥 <b>{server['name']}</b>\n"
+        f"👤 User: <code>{server['username']}</code>\n"
+        f"🌐 IP: <code>{server['ip']}</code>\n"
+        f"💻 OS: {platform.system()} {platform.release()}\n"
+        f"⏱ Uptime: {uptime.uptime() // 3600} hrs\n"
+        f"🧠 RAM: {round(psutil.virtual_memory().total / 1e9, 2)} GB\n"
+        f"💾 Disk: {round(psutil.disk_usage('/').total / 1e9, 2)} GB\n"
+        f"🔥 CPU Usage: {psutil.cpu_percent()}%"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_button(f"server_{server_id}"))
+
+# --- PLACEHOLDER MODULES ---
+
+@dp.callback_query_handler(lambda c: c.data.startswith("file_"))
+async def file_manager(callback: types.CallbackQuery):
+    await callback.message.edit_text("🗂 File Manager: Coming soon", reply_markup=back_button(callback.data.replace("file_", "server_")))
+
+@dp.callback_query_handler(lambda c: c.data.startswith("bot_"))
+async def bot_manager(callback: types.CallbackQuery):
+    await callback.message.edit_text("🤖 Bot Manager: Coming soon", reply_markup=back_button(callback.data.replace("bot_", "server_")))
+
+# --- TO DO: Edit Server ---
+
 
 # Edit Server Menu
 @dp.callback_query_handler(lambda c: c.data.startswith("edit:"))
@@ -215,3 +240,5 @@ async def cancel_back(callback: types.CallbackQuery):
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
+
+
