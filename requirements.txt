@@ -1,5 +1,6 @@
 python-telegram-bot==20.0
-paramiko
-pymongo
-python-dotenv 
-cryptography
+pymongo==4.3.3
+paramiko==3.2.0
+dnspython==2.3.0
+pyOpenSSL==23.2.0
+cryptography==40.0.2
