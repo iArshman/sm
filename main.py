@@ -13,12 +13,17 @@ from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup,
                            InputFile, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.default import DefaultBotProperties
 
 from config import BOT_TOKEN, ADMIN_IDS
 from db import (add_server, delete_server_by_id, get_servers,
                 update_server_name, update_server_username, get_server_by_id)
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML, session=AiohttpSession())
+bot = Bot(
+    token=BOT_TOKEN,
+    session=AiohttpSession(),
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
 user_sessions = {}
