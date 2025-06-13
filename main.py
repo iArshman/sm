@@ -65,6 +65,7 @@ def get_ssh_session(server_id, ip, username, key_content):
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, username=username, pkey=ssh_key, timeout=10)
         active_sessions[server_id] = ssh
+        logger.info(f"Created new SSH session for {server_id}")
         return ssh
     except Exception as e:
         logger.error(f"Failed to create SSH session for {ip}: {e}")
@@ -136,6 +137,21 @@ def get_remote_stats(server_id, ip, username, key_content):
     except Exception as e:
         logger.error(f"SSH error for {ip}: {e}")
         return {"error": str(e)}
+
+# --- STARTUP HOOK ---
+async def on_startup(_):
+    logger.info("Bot starting, attempting to connect to all servers...")
+    try:
+        servers = await get_servers()
+        for server in servers:
+            server_id = str(server['_id'])
+            try:
+                get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+                logger.info(f"Successfully connected to server {server['name']} ({server['ip']})")
+            except Exception as e:
+                logger.error(f"Failed to connect to server {server['name']} ({server['ip']}): {e}")
+    except Exception as e:
+        logger.error(f"Error during startup: {e}")
 
 # --- START ---
 @dp.message_handler(commands=['start'])
@@ -230,6 +246,9 @@ async def handle_key_upload(message: types.Message):
                     pass
                 active_sessions.pop(str(data.get('_id')), None)
             await add_server(data)
+            # Establish session immediately after adding
+            server_id = str((await get_servers())[-1]['_id'])  # Get ID of newly added server
+            get_ssh_session(server_id, data['ip'], data['username'], key_content)
             await message.answer("✅ Server added successfully!")
         except Exception as e:
             logger.error(f"SSH connection failed for {data['ip']}: {e}")
@@ -407,4 +426,4 @@ async def handle_renames(message: types.Message):
         await start(message)
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
