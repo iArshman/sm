@@ -1,11 +1,8 @@
-# main.py
-
 import logging
 import os
 import platform
 import paramiko
 import psutil
-
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
@@ -150,95 +147,75 @@ async def server_info(callback: types.CallbackQuery):
     )
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_button(f"server_{server_id}"))
 
-# --- PLACEHOLDER MODULES ---
-
+# --- FILE MANAGER PLACEHOLDER ---
 @dp.callback_query_handler(lambda c: c.data.startswith("file_"))
 async def file_manager(callback: types.CallbackQuery):
     await callback.message.edit_text("🗂 File Manager: Coming soon", reply_markup=back_button(callback.data.replace("file_", "server_")))
 
+# --- BOT MANAGER PLACEHOLDER ---
 @dp.callback_query_handler(lambda c: c.data.startswith("bot_"))
 async def bot_manager(callback: types.CallbackQuery):
     await callback.message.edit_text("🤖 Bot Manager: Coming soon", reply_markup=back_button(callback.data.replace("bot_", "server_")))
 
-# --- TO DO: Edit Server ---
-
-
-# Edit Server Menu
-@dp.callback_query_handler(lambda c: c.data.startswith("edit:"))
+# --- EDIT SERVER ---
+@dp.callback_query_handler(lambda c: c.data.startswith("edit_"))
 async def edit_server(callback: types.CallbackQuery):
-    sid = callback.data.split(":")[1]
-    server = get_server_by_id(sid)
-    if not server:
-        return await callback.message.edit_text("❌ Server not found.")
-
+    server_id = callback.data.split("_")[1]
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("📝 Change Name", callback_data=f"rename:{sid}"),
-        InlineKeyboardButton("👤 Change Username", callback_data=f"reuser:{sid}")
+        InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{server_id}"),
+        InlineKeyboardButton("👤 Change Username", callback_data=f"reuser_{server_id}"),
+        InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{server_id}"),
     )
-    kb.add(InlineKeyboardButton("🗑️ Delete Server", callback_data=f"delete_confirm:{sid}"))
-    kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"server:{sid}"))
+    kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"server_{server_id}"))
+    await callback.message.edit_text("✏️ Edit Server", reply_markup=kb)
 
-    await callback.message.edit_text(f"✏️ Edit Server: <b>{server['name']}</b>", reply_markup=kb)
-
-# Delete Confirmation
-@dp.callback_query_handler(lambda c: c.data.startswith("delete_confirm:"))
-async def confirm_delete(callback: types.CallbackQuery):
-    sid = callback.data.split(":")[1]
-    server = get_server_by_id(sid)
-    if not server:
-        return await callback.message.edit_text("❌ Server not found.")
-
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("✅ Yes, delete", callback_data=f"delete:{sid}"))
-    kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"server:{sid}"))
-
-    await callback.message.edit_text(f"⚠️ Are you sure you want to delete <b>{server['name']}</b>?", reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("delete:"))
-async def do_delete(callback: types.CallbackQuery):
-    sid = callback.data.split(":")[1]
-    delete_server_by_id(sid)
-    await callback.message.edit_text("✅ Server deleted.")
-    await asyncio.sleep(1)
-    await show_main_menu(callback)
-
-# Rename
-@dp.callback_query_handler(lambda c: c.data.startswith("rename:"))
+@dp.callback_query_handler(lambda c: c.data.startswith("rename_"))
 async def rename_server(callback: types.CallbackQuery):
-    sid = callback.data.split(":")[1]
-    user_state[callback.from_user.id] = {'rename': sid}
-    await callback.message.edit_text("📝 Send new name:\n/cancel to abort")
+    sid = callback.data.split("_")[1]
+    user_input[callback.from_user.id] = {'edit': 'name', 'id': sid}
+    await bot.send_message(callback.from_user.id, "✏️ Enter new name:", reply_markup=cancel_button())
 
-@dp.message_handler(lambda m: m.from_user.id in user_state and 'rename' in user_state[m.from_user.id])
-async def handle_rename(message: types.Message):
-    sid = user_state[message.from_user.id]['rename']
-    update_server_name(sid, message.text)
-    user_state.pop(message.from_user.id)
-    await message.answer("✅ Server name updated.")
-    await show_main_menu(message)
+@dp.callback_query_handler(lambda c: c.data.startswith("reuser_"))
+async def change_username(callback: types.CallbackQuery):
+    sid = callback.data.split("_")[1]
+    user_input[callback.from_user.id] = {'edit': 'username', 'id': sid}
+    await bot.send_message(callback.from_user.id, "👤 Enter new username:", reply_markup=cancel_button())
 
-# Reuser
-@dp.callback_query_handler(lambda c: c.data.startswith("reuser:"))
-async def reuser_server(callback: types.CallbackQuery):
-    sid = callback.data.split(":")[1]
-    user_state[callback.from_user.id] = {'reuser': sid}
-    await callback.message.edit_text("👤 Send new username:\n/cancel to abort")
+@dp.callback_query_handler(lambda c: c.data.startswith("delete_"))
+async def confirm_delete(callback: types.CallbackQuery):
+    sid = callback.data.split("_")[1]
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Yes, delete", callback_data=f"delete_confirm_{sid}"),
+        InlineKeyboardButton("⬅️ Back", callback_data=f"edit_{sid}")
+    )
+    await callback.message.edit_text("⚠️ Are you sure you want to delete this server?", reply_markup=kb)
 
-@dp.message_handler(lambda m: m.from_user.id in user_state and 'reuser' in user_state[m.from_user.id])
-async def handle_reuser(message: types.Message):
-    sid = user_state[message.from_user.id]['reuser']
-    update_server_username(sid, message.text)
-    user_state.pop(message.from_user.id)
-    await message.answer("✅ Server username updated.")
-    await show_main_menu(message)
+@dp.callback_query_handler(lambda c: c.data.startswith("delete_confirm_"))
+async def delete_confirm(callback: types.CallbackQuery):
+    sid = callback.data.split("_")[2]
+    await delete_server_by_id(sid)
+    await callback.message.edit_text("✅ Server deleted.")
+    await start(callback.message)
 
-# Cancel
-@dp.callback_query_handler(lambda c: c.data == "back")
-async def cancel_back(callback: types.CallbackQuery):
-    await show_main_menu(callback)
+@dp.message_handler()
+async def handle_renames(message: types.Message):
+    uid = message.from_user.id
+    if uid not in user_input or 'edit' not in user_input[uid]:
+        return
+    data = user_input[uid]
+    sid = data['id']
+
+    if data['edit'] == 'name':
+        await update_server_name(sid, message.text)
+        await message.answer("✅ Name updated.")
+    elif data['edit'] == 'username':
+        await update_server_username(sid, message.text)
+        await message.answer("✅ Username updated.")
+
+    user_input.pop(uid, None)
+    await start(message)
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
-
-
