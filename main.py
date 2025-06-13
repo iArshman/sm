@@ -1,5 +1,5 @@
 import logging
-import os
+import io
 import paramiko
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -34,12 +34,30 @@ def back_button(to):
 user_input = {}
 
 # --- HELPER: FETCH REMOTE SERVER STATS ---
-def get_remote_stats(ip, username, key_path):
+def get_remote_stats(ip, username, key_content):
     logger.info(f"Fetching stats for {ip} with user {username}")
     try:
+        # Load SSH key from string
+        key_file = io.StringIO(key_content)
+        ssh_key = None
+        try:
+            ssh_key = paramiko.RSAKey.from_private_key(key_file)
+        except paramiko.SSHException:
+            logger.info("Not an RSA key, trying ECDSA...")
+            key_file.seek(0)
+            try:
+                ssh_key = paramiko.ECDSAKey.from_private_key(key_file)
+            except paramiko.SSHException:
+                logger.info("Not an ECDSA key, trying Ed25519...")
+                key_file.seek(0)
+                ssh_key = paramiko.Ed25519Key.from_private_key(key_file)
+
+        if not ssh_key:
+            raise paramiko.SSHException("Unsupported or invalid key format")
+
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip, username=username, key_filename=key_path, timeout=10)
+        ssh.connect(ip, username=username, pkey=ssh_key, timeout=10)
 
         # Get OS info
         stdin, stdout, stderr = ssh.exec_command("uname -sr")
@@ -59,7 +77,7 @@ def get_remote_stats(ip, username, key_path):
             stdin, stdout, stderr = ssh.exec_command("free -m")
             ram_lines = stdout.read().decode().splitlines()
             if len(ram_lines) > 1:
-                ram_total = round(int(ram_lines[1].split()[1]) / 1024, 2)  # Convert MB to GB
+                ram_total = round(int(ram_lines[1].split()[1]) / 1024, 2)
             else:
                 logger.warning("Unexpected 'free -m' output format")
         except (IndexError, ValueError) as e:
@@ -162,27 +180,37 @@ async def handle_key_upload(message: types.Message):
 
     try:
         file = await bot.download_file_by_id(message.document.file_id)
-        key_path = f"/tmp/{message.document.file_name}"
-        with open(key_path, "wb") as f:
-            f.write(file.read())
-
+        key_content = file.read().decode('utf-8')
         data = user_input[uid]
-        data['key_path'] = key_path
+        data['key_content'] = key_content
         await message.answer("🔌 Connecting to server...")
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         try:
-            ssh.connect(data['ip'], username=data['username'], key_filename=key_path, timeout=10)
+            # Validate key by attempting to load it
+            key_file = io.StringIO(key_content)
+            ssh_key = None
+            try:
+                ssh_key = paramiko.RSAKey.from_private_key(key_file)
+            except paramiko.SSHException:
+                key_file.seek(0)
+                try:
+                    ssh_key = paramiko.ECDSAKey.from_private_key(key_file)
+                except paramiko.SSHException:
+                    key_file.seek(0)
+                    ssh_key = paramiko.Ed25519Key.from_private_key(key_file)
+
+            if not ssh_key:
+                raise paramiko.SSHException("Invalid key format")
+
+            ssh.connect(data['ip'], username=data['username'], pkey=ssh_key, timeout=10)
             ssh.close()
             await add_server(data)
             await message.answer("✅ Server added successfully!")
         except Exception as e:
             logger.error(f"SSH connection failed for {data['ip']}: {e}")
             await message.answer(f"❌ SSH connection failed: {e}")
-        finally:
-            if os.path.exists(key_path):
-                os.unlink(key_path)  # Clean up key file
 
         user_input.pop(uid, None)
         await start(message)
@@ -224,7 +252,7 @@ async def server_info(callback: types.CallbackQuery):
             return
 
         await callback.message.edit_text("📊 Fetching server stats...", parse_mode="HTML")
-        stats = get_remote_stats(server['ip'], server['username'], server['key_path'])
+        stats = get_remote_stats(server['ip'], server['username'], server['key_content'])
         if stats.get('error'):
             text = (
                 f"🖥 <b>{server['name']}</b>\n"
