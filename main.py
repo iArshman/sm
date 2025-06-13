@@ -80,46 +80,58 @@ def get_remote_stats(server_id, ip, username, key_content):
         # Get OS info
         stdin, stdout, stderr = ssh.exec_command("uname -sr")
         os_info = stdout.read().decode().strip() or "Unknown"
-        if stderr.read().decode().strip():
-            logger.warning(f"OS command error: {stderr.read().decode().strip()}")
+        stderr_output = stderr.read().decode().strip()
+        if stderr_output:
+            logger.warning(f"OS command error: {stderr_output}")
 
         # Get uptime
         stdin, stdout, stderr = ssh.exec_command("uptime -p")
         uptime = stdout.read().decode().strip().replace("up ", "") or "Unknown"
-        if stderr.read().decode().strip():
-            logger.warning(f"Uptime command error: {stderr.read().decode().strip()}")
+        stderr_output = stderr.read().decode().strip()
+        if stderr_output:
+            logger.warning(f"Uptime command error: {stderr_output}")
 
-        # Get RAM (in GB)
-        ram_total = "Unknown"
+        # Get memory (total and used in GB)
+        ram_total = ram_used = "Unknown"
         try:
             stdin, stdout, stderr = ssh.exec_command("free -m")
-            ram_lines = stdout.read().decode().splitlines()
-            if len(ram_lines) > 1:
-                ram_total = round(int(ram_lines[1].split()[1]) / 1024, 2)
+            mem_lines = stdout.read().decode().splitlines()
+            logger.debug(f"free -m output: {mem_lines}")
+            if len(mem_lines) > 1:
+                mem_data = mem_lines[1].split()
+                ram_total = round(int(mem_data[1]) / 1024, 2)  # Total in GB
+                ram_used = round(int(mem_data[2]) / 1024, 2)  # Used in GB
             else:
                 logger.warning("Unexpected 'free -m' output format")
         except (IndexError, ValueError) as e:
-            logger.error(f"RAM parsing error: {e}")
+            logger.error(f"Memory parsing error: {e}")
 
-        # Get disk (in GB)
-        disk_total = "Unknown"
+        # Get disk (total and used in GB)
+        disk_total = disk_used = "Unknown"
         try:
             stdin, stdout, stderr = ssh.exec_command("df -h /")
             disk_lines = stdout.read().decode().splitlines()
+            logger.debug(f"df -h output: {disk_lines}")
             if len(disk_lines) > 1:
-                disk_total = float(disk_lines[1].split()[1].replace("G", ""))
+                disk_data = disk_lines[1].split()
+                disk_total = float(disk_data[1].replace("G", ""))
+                disk_used = float(disk_data[2].replace("G", ""))
             else:
                 logger.warning("Unexpected 'df -h' output format")
         except (IndexError, ValueError) as e:
             logger.error(f"Disk parsing error: {e}")
 
-        # Get CPU usage
+        # Get CPU usage (%)
         cpu_usage = "Unknown"
         try:
             stdin, stdout, stderr = ssh.exec_command("top -bn1 | head -n3")
-            cpu_line = stdout.read().decode().splitlines()
-            if len(cpu_line) > 2:
-                cpu_idle = float(cpu_line[2].split()[-2])
+            cpu_lines = stdout.read().decode().splitlines()
+            logger.debug(f"top output: {cpu_lines}")
+            if len(cpu_lines) > 2:
+                cpu_line = [line for line in cpu_lines if line.startswith("%Cpu")][0]
+                cpu_fields = cpu_line.split()
+                idle_index = cpu_fields.index("id,") - 1
+                cpu_idle = float(cpu_fields[idle_index])
                 cpu_usage = round(100 - cpu_idle, 2)
             else:
                 logger.warning("Unexpected 'top' output format")
@@ -130,7 +142,9 @@ def get_remote_stats(server_id, ip, username, key_content):
             "os": os_info,
             "uptime": uptime,
             "ram_total": ram_total,
+            "ram_used": ram_used,
             "disk_total": disk_total,
+            "disk_used": disk_used,
             "cpu_usage": cpu_usage,
             "error": None
         }
@@ -166,6 +180,21 @@ async def start(message: types.Message):
     except Exception as e:
         logger.error(f"Start handler error: {e}")
         await message.answer("❌ Error loading servers. Please try again.")
+
+# --- BACK TO START ---
+@dp.callback_query_handler(lambda c: c.data == "start")
+async def back_to_start(callback: types.CallbackQuery):
+    try:
+        await callback.message.delete()
+        servers = await get_servers()
+        kb = InlineKeyboardMarkup(row_width=1)
+        for server in servers:
+            kb.add(InlineKeyboardButton(f"🖥 {server['name']}", callback_data=f"server_{server['_id']}"))
+        kb.add(InlineKeyboardButton("➕ Add Server", callback_data="add_server"))
+        await bot.send_message(callback.from_user.id, "🔧 <b>Multi Server Manager</b>", parse_mode='HTML', reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Back to start error: {e}")
+        await callback.message.edit_text("❌ Error returning to main menu.")
 
 # --- CANCEL HANDLER ---
 @dp.callback_query_handler(lambda c: c.data == "cancel")
@@ -247,7 +276,7 @@ async def handle_key_upload(message: types.Message):
                 active_sessions.pop(str(data.get('_id')), None)
             await add_server(data)
             # Establish session immediately after adding
-            server_id = str((await get_servers())[-1]['_id'])  # Get ID of newly added server
+            server_id = str((await get_servers())[-1]['_id'])
             get_ssh_session(server_id, data['ip'], data['username'], key_content)
             await message.answer("✅ Server added successfully!")
         except Exception as e:
@@ -309,8 +338,10 @@ async def server_info(callback: types.CallbackQuery):
                 f"🌐 IP: <code>{server['ip']}</code>\n"
                 f"💻 OS: {stats['os']}\n"
                 f"⏱ Uptime: {stats['uptime']}\n"
-                f"🧠 RAM: {stats['ram_total']} GB\n"
-                f"💾 Disk: {stats['disk_total']} GB\n"
+                f"🧠 Total Memory: {stats['ram_total']} GB\n"
+                f"🧠 Used Memory: {stats['ram_used']} GB\n"
+                f"💾 Total Disk: {stats['disk_total']} GB\n"
+                f"💾 Used Disk: {stats['disk_used']} GB\n"
                 f"🔥 CPU Usage: {stats['cpu_usage']}%"
             )
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_button(f"server_{server_id}"))
@@ -371,21 +402,35 @@ async def change_username(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("delete_"))
 async def confirm_delete(callback: types.CallbackQuery):
     try:
+        logger.info(f"Delete callback data: {callback.data}")
+        if not callback.data.startswith("delete_"):
+            raise ValueError("Invalid delete callback data")
         sid = callback.data.split("_")[1]
+        server = await get_server_by_id(sid)
+        if not server:
+            raise ValueError(f"Server {sid} not found")
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
             InlineKeyboardButton("✅ Yes, delete", callback_data=f"delete_confirm_{sid}"),
             InlineKeyboardButton("⬅️ Back", callback_data=f"edit_{sid}")
         )
-        await callback.message.edit_text("⚠️ Are you sure you want to delete this server?", reply_markup=kb)
+        await callback.message.edit_text(f"⚠️ Are you sure you want to delete server '{server['name']}'?", reply_markup=kb)
     except Exception as e:
         logger.error(f"Confirm delete error: {e}")
-        await callback.message.edit_text("❌ Error initiating delete.")
+        try:
+            await callback.message.edit_text("❌ Error initiating delete.")
+        except:
+            await bot.send_message(callback.from_user.id, "❌ Error initiating delete.")
 
+# --- DELETE CONFIRM ---
 @dp.callback_query_handler(lambda c: c.data.startswith("delete_confirm_"))
 async def delete_confirm(callback: types.CallbackQuery):
     try:
+        logger.info(f"Delete confirm callback data: {callback.data}")
         sid = callback.data.split("_")[2]
+        server = await get_server_by_id(sid)
+        if not server:
+            raise ValueError(f"Server {sid} not found")
         await delete_server_by_id(sid)
         # Clean up SSH session
         if sid in active_sessions:
@@ -394,11 +439,14 @@ async def delete_confirm(callback: types.CallbackQuery):
             except:
                 pass
             active_sessions.pop(sid, None)
-        await callback.message.edit_text("✅ Server deleted.")
+        await callback.message.edit_text(f"✅ Server '{server['name']}' deleted.")
         await start(callback.message)
     except Exception as e:
         logger.error(f"Delete confirm error: {e}")
-        await callback.message.edit_text("❌ Error deleting server.")
+        try:
+            await callback.message.edit_text("❌ Error deleting server.")
+        except:
+            await bot.send_message(callback.from_user.id, "❌ Error deleting server.")
 
 # --- HANDLE RENAME/USERNAME INPUTS ---
 @dp.message_handler(lambda message: message.from_user.id in user_input and user_input[message.from_user.id].get('edit') in ['name', 'username'])
