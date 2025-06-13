@@ -289,8 +289,15 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Upload file start error for server {server_id}: {e}")
             await callback.message.edit_text("❌ Error initiating file upload.", reply_markup=back_button(f"server_{server_id}"))
 
+    # --- FILTER FOR FILE UPLOAD ---
+    def is_file_upload_mode(message: types.Message):
+        return (
+            message.from_user.id in user_input and
+            user_input[message.from_user.id].get('mode') == 'file_upload'
+        )
+
     # --- HANDLE FILE UPLOAD ---
-    @dp.message_handler(content_types=types.ContentType.DOCUMENT, lambda m: m.from_user.id in user_input and user_input[m.from_user.id].get('mode') == 'file_upload')
+    @dp.message_handler(is_file_upload_mode, content_types=types.ContentType.DOCUMENT)
     async def handle_file_upload(message: types.Message):
         try:
             uid = message.from_user.id
