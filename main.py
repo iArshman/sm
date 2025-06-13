@@ -13,17 +13,12 @@ from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup,
                            InputFile, Message)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.default import DefaultBotProperties
 
 from config import BOT_TOKEN, ADMIN_IDS
 from db import (add_server, delete_server_by_id, get_servers,
                 update_server_name, update_server_username, get_server_by_id)
 
-bot = Bot(
-    token=BOT_TOKEN,
-    session=AiohttpSession(),
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML, session=AiohttpSession())
 dp = Dispatcher()
 
 user_sessions = {}
@@ -101,13 +96,19 @@ def edit_menu(server_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Edit Name", callback_data=f"edit_name:{server_id}"),
          InlineKeyboardButton(text="👤 Edit Username", callback_data=f"edit_user:{server_id}")],
-        [InlineKeyboardButton(text="🗑 Delete Server", callback_data=f"delete:{server_id}")],
+        [InlineKeyboardButton(text="🗑 Delete Server", callback_data=f"confirm_delete:{server_id}")],
         [InlineKeyboardButton(text="🔙 Back", callback_data=f"server:{server_id}")]
+    ])
+
+def confirm_delete_menu(server_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yes, delete", callback_data=f"delete:{server_id}"),
+         InlineKeyboardButton(text="❌ Cancel", callback_data=f"server:{server_id}")]
     ])
 
 # HANDLERS
 
-@dp.message()
+@dp.message(lambda m: m.text and m.text.lower() == "/start")
 async def handle_start(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.answer("⛔ Unauthorized")
@@ -145,6 +146,10 @@ async def handle_callback(query: types.CallbackQuery):
         server_id = data.split(":")[1]
         user_sessions[user_id] = {"step": "edit_user", "server_id": server_id}
         await query.message.edit_text("👤 Enter new username:\n/cancel to stop")
+
+    elif data.startswith("confirm_delete:"):
+        server_id = data.split(":")[1]
+        await query.message.edit_text("⚠️ Are you sure you want to delete this server?", reply_markup=confirm_delete_menu(server_id))
 
     elif data.startswith("delete:"):
         server_id = data.split(":")[1]
