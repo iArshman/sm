@@ -152,26 +152,32 @@ async def handle_callback(query: types.CallbackQuery):
         await query.message.edit_text("✅ Server deleted", reply_markup=main_menu())
 
     elif data.startswith("info:"):
-        server_id = data.split(":")[1]
-        server = get_server_by_id(server_id)
-        if not server:
-            return await query.message.edit_text("❌ Server not found", reply_markup=main_menu())
+    server_id = data.split(":")[1]
+    server = get_server_by_id(server_id)
+    if not server:
+        return await query.message.edit_text("❌ Server not found", reply_markup=main_menu())
 
-        stats = await get_server_stats(server['username'], server['ip'], server['key_path'])
-        if not stats:
-            return await query.message.edit_text("❌ Unable to fetch server stats", reply_markup=server_menu(server_id))
-
-        text = (
-            f"<b>🖥 Server Info</b>\n"
-            f"👤 User: <code>{server['username']}</code>\n"
-            f"🌐 IP: <code>{server['ip']}</code>\n"
-            f"🖥 OS: <code>{stats['os']}</code>\n"
-            f"⏱ Uptime: <code>{stats['uptime']}</code>\n"
-            f"💾 RAM: <code>{stats['used_ram']} / {stats['total_ram']} MB</code>\n"
-            f"🗄 Disk: <code>{stats['used_disk']} / {stats['total_disk']}</code>\n"
-            f"🧠 CPU Cores: <code>{stats['cpu_cores']}</code>"
+    if 'key_path' not in server:
+        return await query.message.edit_text(
+            "⚠️ This server is missing its SSH key path. Please re-add it or contact the admin.",
+            reply_markup=server_menu(server_id)
         )
-        await query.message.edit_text(text, reply_markup=server_menu(server_id))
+
+    stats = await get_server_stats(server['username'], server['ip'], server['key_path'])
+    if not stats:
+        return await query.message.edit_text("❌ Unable to fetch server stats", reply_markup=server_menu(server_id))
+
+    text = (
+        f"<b>🖥 Server Info</b>\n"
+        f"👤 User: <code>{server['username']}</code>\n"
+        f"🌐 IP: <code>{server['ip']}</code>\n"
+        f"🖥 OS: <code>{stats['os']}</code>\n"
+        f"⏱ Uptime: <code>{stats['uptime']}</code>\n"
+        f"💾 RAM: <code>{stats['used_ram']} / {stats['total_ram']} MB</code>\n"
+        f"🗄 Disk: <code>{stats['used_disk']} / {stats['total_disk']}</code>\n"
+        f"🧠 CPU Cores: <code>{stats['cpu_cores']}</code>"
+    )
+    await query.message.edit_text(text, reply_markup=server_menu(server_id))
 
     elif data.startswith("file:"):
         await query.message.edit_text("📁 File Manager\nComing soon...")
