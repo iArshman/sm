@@ -32,12 +32,18 @@ def back_button(to):
 
 # --- TEMP STATE ---
 user_input = {}
+active_sessions = {}  # Store SSH sessions: {server_id: SSHClient}
 
-# --- HELPER: FETCH REMOTE SERVER STATS ---
-def get_remote_stats(ip, username, key_content):
-    logger.info(f"Fetching stats for {ip} with user {username}")
+# --- HELPER: MANAGE SSH SESSION ---
+def get_ssh_session(server_id, ip, username, key_content):
+    logger.info(f"Getting SSH session for server {server_id} ({ip})")
     try:
-        # Load SSH key from string
+        # Reuse existing session if active
+        if server_id in active_sessions and active_sessions[server_id].get_transport().is_active():
+            logger.info(f"Reusing existing SSH session for {server_id}")
+            return active_sessions[server_id]
+
+        # Create new session
         key_file = io.StringIO(key_content)
         ssh_key = None
         try:
@@ -58,6 +64,17 @@ def get_remote_stats(ip, username, key_content):
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, username=username, pkey=ssh_key, timeout=10)
+        active_sessions[server_id] = ssh
+        return ssh
+    except Exception as e:
+        logger.error(f"Failed to create SSH session for {ip}: {e}")
+        raise
+
+# --- HELPER: FETCH REMOTE SERVER STATS ---
+def get_remote_stats(server_id, ip, username, key_content):
+    logger.info(f"Fetching stats for {ip} with user {username}")
+    try:
+        ssh = get_ssh_session(server_id, ip, username, key_content)
 
         # Get OS info
         stdin, stdout, stderr = ssh.exec_command("uname -sr")
@@ -108,7 +125,6 @@ def get_remote_stats(ip, username, key_content):
         except (IndexError, ValueError) as e:
             logger.error(f"CPU parsing error: {e}")
 
-        ssh.close()
         return {
             "os": os_info,
             "uptime": uptime,
@@ -206,6 +222,13 @@ async def handle_key_upload(message: types.Message):
 
             ssh.connect(data['ip'], username=data['username'], pkey=ssh_key, timeout=10)
             ssh.close()
+            # Clear any existing session for this server if re-adding
+            if str(data.get('_id')) in active_sessions:
+                try:
+                    active_sessions[str(data.get('_id'))].close()
+                except:
+                    pass
+                active_sessions.pop(str(data.get('_id')), None)
             await add_server(data)
             await message.answer("✅ Server added successfully!")
         except Exception as e:
@@ -252,7 +275,7 @@ async def server_info(callback: types.CallbackQuery):
             return
 
         await callback.message.edit_text("📊 Fetching server stats...", parse_mode="HTML")
-        stats = get_remote_stats(server['ip'], server['username'], server['key_content'])
+        stats = get_remote_stats(server_id, server['ip'], server['username'], server['key_content'])
         if stats.get('error'):
             text = (
                 f"🖥 <b>{server['name']}</b>\n"
@@ -345,6 +368,13 @@ async def delete_confirm(callback: types.CallbackQuery):
     try:
         sid = callback.data.split("_")[2]
         await delete_server_by_id(sid)
+        # Clean up SSH session
+        if sid in active_sessions:
+            try:
+                active_sessions[sid].close()
+            except:
+                pass
+            active_sessions.pop(sid, None)
         await callback.message.edit_text("✅ Server deleted.")
         await start(callback.message)
     except Exception as e:
