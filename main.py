@@ -16,6 +16,7 @@ from db import (
 )
 from bson.objectid import ObjectId
 from bson.errors import InvalidId
+from file_manager import init_file_manager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ def cancel_button():
 def back_button(to):
     return InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=to))
 
-# Convert seconds to human-readable uptime (e.g., "2 days, 3 hours")
+# Convert seconds to human-readable uptime
 def format_uptime(seconds):
     if not isinstance(seconds, (int, float)) or seconds < 0:
         return "Unknown"
@@ -56,12 +57,9 @@ active_sessions = {}  # Store SSH sessions: {server_id: SSHClient}
 def get_ssh_session(server_id, ip, username, key_content):
     logger.info(f"Getting SSH session for server {server_id} ({ip})")
     try:
-        # Reuse existing session if active
         if server_id in active_sessions and active_sessions[server_id].get_transport().is_active():
             logger.info(f"Reusing existing SSH session for {server_id}")
             return active_sessions[server_id]
-
-        # Create new session
         key_file = io.StringIO(key_content)
         ssh_key = None
         try:
@@ -75,10 +73,8 @@ def get_ssh_session(server_id, ip, username, key_content):
                 logger.info("Not an ECDSA key, trying Ed25519...")
                 key_file.seek(0)
                 ssh_key = paramiko.Ed25519Key.from_private_key(key_file)
-
         if not ssh_key:
             raise paramiko.SSHException("Unsupported or invalid key format")
-
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, username=username, pkey=ssh_key, timeout=10)
@@ -94,8 +90,6 @@ def get_remote_stats(server_id, ip, username, key_content):
     logger.info(f"Fetching stats for {ip} with user {username}")
     try:
         ssh = get_ssh_session(server_id, ip, username, key_content)
-
-        # Get OS info (distribution and kernel)
         os_info = "Unknown"
         try:
             stdin, stdout, stderr = ssh.exec_command("cat /etc/os-release")
@@ -109,7 +103,6 @@ def get_remote_stats(server_id, ip, username, key_content):
                     key, value = line.split('=', 1)
                     os_dict[key.strip()] = value.strip().strip('"')
             distro = os_dict.get('PRETTY_NAME', 'Unknown')
-
             stdin, stdout, stderr = ssh.exec_command("uname -r")
             kernel = stdout.read().decode().strip() or "Unknown"
             stderr_output = stderr.read().decode().strip()
@@ -119,8 +112,6 @@ def get_remote_stats(server_id, ip, username, key_content):
             logger.debug(f"OS info: {os_info}")
         except Exception as e:
             logger.error(f"OS info parsing error: {e}")
-
-        # Get uptime (from /proc/uptime)
         uptime = "Unknown"
         try:
             stdin, stdout, stderr = ssh.exec_command("cat /proc/uptime")
@@ -133,8 +124,6 @@ def get_remote_stats(server_id, ip, username, key_content):
             logger.debug(f"Uptime: {uptime} ({uptime_seconds} seconds)")
         except (IndexError, ValueError) as e:
             logger.error(f"Uptime parsing error: {e}")
-
-        # Get memory (total and used in GB)
         ram_total = ram_used = "Unknown"
         try:
             stdin, stdout, stderr = ssh.exec_command("free -m")
@@ -142,14 +131,12 @@ def get_remote_stats(server_id, ip, username, key_content):
             logger.debug(f"free -m output: {mem_lines}")
             if len(mem_lines) > 1:
                 mem_data = mem_lines[1].split()
-                ram_total = round(int(mem_data[1]) / 1024, 2)  # Total in GB
-                ram_used = round(int(mem_data[2]) / 1024, 2)  # Used in GB
+                ram_total = round(int(mem_data[1]) / 1024, 2)
+                ram_used = round(int(mem_data[2]) / 1024, 2)
             else:
                 logger.warning("Unexpected 'free -m' output format")
         except (IndexError, ValueError) as e:
             logger.error(f"Memory parsing error: {e}")
-
-        # Get disk (total and used in GB)
         disk_total = disk_used = "Unknown"
         try:
             stdin, stdout, stderr = ssh.exec_command("df -h /")
@@ -163,8 +150,6 @@ def get_remote_stats(server_id, ip, username, key_content):
                 logger.warning("Unexpected 'df -h' output format")
         except (IndexError, ValueError) as e:
             logger.error(f"Disk parsing error: {e}")
-
-        # Get CPU usage (%)
         cpu_usage = "Unknown"
         try:
             stdin, stdout, stderr = ssh.exec_command("top -bn1 | head -n3")
@@ -180,7 +165,6 @@ def get_remote_stats(server_id, ip, username, key_content):
                 logger.warning("Unexpected 'top' output format")
         except (IndexError, ValueError) as e:
             logger.error(f"CPU parsing error: {e}")
-
         return {
             "os": os_info,
             "uptime": uptime,
@@ -206,9 +190,10 @@ async def on_startup(_):
                 get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
                 logger.info(f"Successfully connected to server {server['name']} ({server['ip']})")
             except Exception as e:
-                logger.error(f"Failed to connect to server {server['name']} ({server['ip']}): {e}")
+                logger.error(f"Failed to connect to server {server['name']} ({server['ip']}: {e}")
     except Exception as e:
         logger.error(f"Error during startup: {e}")
+    init_file_manager(dp, bot, active_sessions, user_input)
 
 # --- START ---
 @dp.message_handler(commands=['start'])
@@ -260,17 +245,14 @@ async def handle_inputs(message: types.Message):
         return
     step = user_input[uid]['step']
     logger.info(f"Handling input for user {uid}, step: {step}")
-
     if step == 'name':
         user_input[uid]['name'] = message.text
         user_input[uid]['step'] = 'username'
         await message.answer("👤 Enter username:", reply_markup=cancel_button())
-
     elif step == 'username':
         user_input[uid]['username'] = message.text
         user_input[uid]['step'] = 'ip'
         await message.answer("🌐 Enter IP address:", reply_markup=cancel_button())
-
     elif step == 'ip':
         user_input[uid]['ip'] = message.text
         user_input[uid]['step'] = 'key'
@@ -281,7 +263,6 @@ async def handle_key_upload(message: types.Message):
     uid = message.from_user.id
     if uid not in user_input or user_input[uid].get('step') != 'key':
         return
-
     try:
         file = await bot.download_file_by_id(message.document.file_id)
         key_content = file.read().decode('utf-8')
@@ -290,9 +271,7 @@ async def handle_key_upload(message: types.Message):
         await message.answer("🔌 Connecting to server...")
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
         try:
-            # Validate key by attempting to load it
             key_file = io.StringIO(key_content)
             ssh_key = None
             try:
@@ -307,10 +286,8 @@ async def handle_key_upload(message: types.Message):
                         ssh_key = paramiko.Ed25519Key.from_private_key(key_file)
                     except paramiko.SSHException:
                         raise ValueError("Invalid key format")
-
             ssh.connect(data['ip'], username=data['username'], pkey=ssh_key, timeout=10)
             ssh.close()
-            # Clear any existing session for this server if re-added
             if str(data.get('_id')) in active_sessions:
                 try:
                     active_sessions[str(data.get('_id'))].close()
@@ -318,7 +295,6 @@ async def handle_key_upload(message: types.Message):
                     pass
                 active_sessions.pop(str(data.get('_id')), None)
             await add_server(data)
-            # Establish session immediately after adding
             server_id = str((await get_servers())[-1]['_id'])
             try:
                 get_ssh_session(server_id, data['ip'], data['username'], key_content)
@@ -328,7 +304,6 @@ async def handle_key_upload(message: types.Message):
         except Exception as e:
             logger.error(f"SSH connection failed for {data['ip']}: {e}")
             await message.answer(f"❌ SSH connection failed: {e}")
-
         user_input.pop(uid, None)
         await start(message)
     except Exception as e:
@@ -350,9 +325,9 @@ async def view_server(callback: types.CallbackQuery):
             InlineKeyboardButton("🗂 File Manager", callback_data=f"file_manager_{server_id}"),
             InlineKeyboardButton("📊 Server Info", callback_data=f"info_{server_id}"),
             InlineKeyboardButton("🤖 Bot Manager", callback_data=f"bot_manager_{server_id}"),
-            InlineKeyboardButton("✏ Edit", callback_data=f"edit_{server_id}"),
+            InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{server_id}"),
         )
-        kb.add(InlineKeyboardButton("⬅ Back", callback_data="start"))
+        kb.add(InlineKeyboardButton("⬅️ Back", callback_data="start"))
         await callback.message.edit_text(f"🖥 <b>{server['name']}</b>", parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         logger.error(f"View server error for {server_id}: {e}")
@@ -368,7 +343,7 @@ async def server_info(callback: types.CallbackQuery):
             await callback.message.edit_text("❌ Server not found.")
             return
         await callback.message.edit_text("📊 Fetching server stats...", parse_mode="HTML")
-        stats = get_server_info(server_id, server['ip'], server['username'], server['key_content'])
+        stats = get_remote_stats(server_id, server['ip'], server['username'], server['key_content'])
         if stats.get('error'):
             text = (
                 f"🖥 <b>{server['name']}</b>\n"
@@ -394,15 +369,11 @@ async def server_info(callback: types.CallbackQuery):
         logger.error(f"Server info error for server {server_id}: {e}")
         await callback.message.edit_text("❌ Error fetching server info. Please try again.")
 
-# --- FILE MANAGER PLACEHOLDER ---
-@dp.callback_query_handler(lambda c: c.data.startswith("file_"))
-async def file_manager(callback: types.CallbackQuery):
-    await callback.message.edit_text("🗂 File Manager: Coming soon", reply_markup=back_button(callback.data.replace("file_", "server_")))
-
 # --- BOT MANAGER PLACEHOLDER ---
-@dp.callback_query_handler(lambda c: c.data.startswith("bot_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("bot_manager_"))
 async def bot_manager(callback: types.CallbackQuery):
-    await callback.message.edit_text("🤖 Bot Manager: Coming soon", reply_markup=back_button(callback.data.replace("bot_", "server_")))
+    server_id = callback.data.split('_')[2]
+    await callback.message.edit_text("🤖 Bot Manager: Coming soon", reply_markup=back_button(f"server_{server_id}"))
 
 # --- EDIT SERVER ---
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_"))
@@ -411,12 +382,12 @@ async def edit_server(callback: types.CallbackQuery):
         server_id = callback.data.split('_')[1]
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
-            InlineKeyboardButton("✏ Rename", callback_data=f"rename_{server_id}"),
+            InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{server_id}"),
             InlineKeyboardButton("👤 Change Username", callback_data=f"reuser_{server_id}"),
             InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{server_id}"),
         )
-        kb.add(InlineKeyboardButton("⬅ Back", callback_data=f"server_{server_id}"))
-        await callback.message.edit_text("✏ Edit Server", parse_mode='HTML', reply_markup=kb)
+        kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"server_{server_id}"))
+        await callback.message.edit_text("✏️ Edit Server", parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         logger.error(f"Edit server error: {e}")
         await callback.message.edit_text("❌ Error loading edit menu.")
@@ -427,7 +398,7 @@ async def rename_server(callback: types.CallbackQuery):
     try:
         sid = callback.data.split('_')[1]
         user_input[callback.from_user.id] = {'edit': 'name', 'id': sid}
-        await bot.send_message(callback.from_user.id, "✏ Enter new name:", reply_markup=cancel_button())
+        await bot.send_message(callback.from_user.id, "✏️ Enter new name:", reply_markup=cancel_button())
     except Exception as e:
         logger.error(f"Rename server error: {e}")
         await callback.message.edit_text("❌ Error initiating rename.")
@@ -453,7 +424,7 @@ async def confirm_delete(callback: types.CallbackQuery):
             raise ValueError(f"Invalid delete callback data: {callback.data}")
         sid = parts[1]
         try:
-            ObjectId(sid)  # Validate ObjectId
+            ObjectId(sid)
         except InvalidId:
             raise ValueError(f"Invalid server ID: {sid}")
         server = await get_server_by_id(sid)
@@ -462,9 +433,9 @@ async def confirm_delete(callback: types.CallbackQuery):
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
             InlineKeyboardButton("✅ Yes, delete", callback_data=f"delete_confirm_{sid}"),
-            InlineKeyboardButton("⬅ Back", callback_data=f"edit_{sid}")
+            InlineKeyboardButton("⬅️ Back", callback_data=f"edit_{sid}")
         )
-        await callback.message.edit_text(f"⚠ Are you sure you want to delete server '{server['name']}'?", reply_markup=kb)
+        await callback.message.edit_text(f"⚠️ Are you sure you want to delete server '{server['name']}'?", reply_markup=kb)
     except Exception as e:
         logger.error(f"Confirm delete error: {e}")
         try:
@@ -482,14 +453,13 @@ async def delete_confirm(callback: types.CallbackQuery):
             raise ValueError(f"Invalid delete confirm callback data: {callback.data}")
         sid = parts[2]
         try:
-            ObjectId(sid)  # Validate ObjectId
+            ObjectId(sid)
         except InvalidId:
             raise ValueError(f"Invalid server ID: {sid}")
         server = await get_server_by_id(sid)
         if not server:
             raise ValueError(f"Server {sid} not found")
         await delete_server_by_id(sid)
-        # Clean up SSH session
         if sid in active_sessions:
             try:
                 active_sessions[sid].close()
@@ -515,7 +485,6 @@ async def handle_renames(message: types.Message):
     sid = data['id']
     edit_type = data['edit']
     logger.info(f"Handling rename/username for user {uid}, server {sid}, type: {edit_type}")
-
     try:
         if edit_type == 'name':
             await update_server_name(sid, message.text)
