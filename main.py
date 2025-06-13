@@ -1,220 +1,217 @@
 import logging
-import paramiko
 import asyncio
+import platform
+import paramiko
+import psutil
+import socket
+import time
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import BOT_TOKEN, ADMIN_IDS
-from db import add_server, get_servers, get_server_by_id, update_server_name, update_server_username, delete_server_by_id
+from db import (
+    add_server, get_servers, get_server_by_id,
+    update_server_name, update_server_username, delete_server_by_id
+)
 
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+# Util
+async def is_ssh_accessible(ip, username, pkey_str):
+    try:
+        key = paramiko.RSAKey.from_private_key_file(pkey_str)
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(ip, username=username, pkey=key, timeout=5)
+        ssh.close()
+        return True
+    except Exception as e:
+        return False
 
-user_states = {}
-temp_server_data = {}
-
-
-def cancel_back_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("🔙 Back", callback_data="cancel")
-    )
-    return keyboard
-
-
-def server_list_keyboard():
-    servers = get_servers()
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    for server in servers:
-        keyboard.add(InlineKeyboardButton(f"🖥️ {server['name']}", callback_data=f"server_{server['_id']}"))
-    keyboard.add(InlineKeyboardButton("➕ Add Server", callback_data="add_server"))
-    return keyboard
-
-
-def server_action_keyboard(server_id):
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("📁 File Manager", callback_data=f"file_{server_id}"),
-        InlineKeyboardButton("🤖 Bot Manager", callback_data=f"bot_{server_id}"),
-        InlineKeyboardButton("ℹ️ Server Info", callback_data=f"info_{server_id}"),
-        InlineKeyboardButton("✏️ Edit Server", callback_data=f"edit_{server_id}")
-    )
-    keyboard.add(InlineKeyboardButton("🔙 Back", callback_data="cancel"))
-    return keyboard
-
-
-def edit_server_keyboard(server_id):
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("✏️ Change Name", callback_data=f"change_name_{server_id}"),
-        InlineKeyboardButton("👤 Change Username", callback_data=f"change_username_{server_id}"),
-        InlineKeyboardButton("❌ Delete Server", callback_data=f"delete_{server_id}")
-    )
-    keyboard.add(InlineKeyboardButton("🔙 Back", callback_data=f"server_{server_id}"))
-    return keyboard
-
-
+# Start Command
 @dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
+async def start_cmd(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
-        return await message.answer("Access Denied.")
-    await message.answer("👋 Welcome to Multi Server Manager", reply_markup=server_list_keyboard())
+        return await message.answer("Access denied.")
+    await show_main_menu(message)
 
+async def show_main_menu(message_or_callback):
+    servers = get_servers()
+    kb = InlineKeyboardMarkup(row_width=2)
+    for s in servers:
+        kb.add(InlineKeyboardButton(f"🖥️ {s['name']}", callback_data=f"server:{s['_id']}"))
+    kb.add(InlineKeyboardButton("➕ Add Server", callback_data="add_server"))
 
-@dp.callback_query_handler(lambda c: True)
-async def handle_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    data = callback_query.data
+    text = "<b>🌐 Server Manager</b>\nSelect a server to manage:"
+    if isinstance(message_or_callback, types.CallbackQuery):
+        await message_or_callback.message.edit_text(text, reply_markup=kb)
+    else:
+        await message_or_callback.answer(text, reply_markup=kb)
 
-    if data == "cancel":
-        user_states.pop(user_id, None)
-        temp_server_data.pop(user_id, None)
-        await callback_query.message.edit_text("🔙 Back to server list:", reply_markup=server_list_keyboard())
-        return
+# Add Server Flow
+user_state = {}
 
-    if data == "add_server":
-        user_states[user_id] = 'adding_name'
-        temp_server_data[user_id] = {}
-        await callback_query.message.edit_text("🖋️ Enter server name:", reply_markup=cancel_back_keyboard())
-        return
+@dp.callback_query_handler(lambda c: c.data == "add_server")
+async def handle_add_server(callback: types.CallbackQuery):
+    user_state[callback.from_user.id] = {'step': 'name'}
+    await callback.message.edit_text("📝 Enter server name:\n\n❌ /cancel to abort")
 
-    if data.startswith("server_"):
-        server_id = data.split("_")[1]
-        server = get_server_by_id(server_id)
-        if not server:
-            await callback_query.message.edit_text("❌ Server not found.", reply_markup=server_list_keyboard())
-            return
-        await callback_query.message.edit_text(f"📡 Server: <b>{server['name']}</b>", parse_mode='HTML', reply_markup=server_action_keyboard(server_id))
-        return
+@dp.message_handler(lambda m: m.from_user.id in user_state)
+async def collect_server_info(message: types.Message):
+    uid = message.from_user.id
+    state = user_state.get(uid, {})
+    step = state.get('step')
 
-    if data.startswith("edit_"):
-        server_id = data.split("_")[1]
-        await callback_query.message.edit_text("🛠️ Edit Server:", reply_markup=edit_server_keyboard(server_id))
-        return
+    if message.text == "/cancel":
+        user_state.pop(uid, None)
+        return await message.answer("❌ Cancelled.", reply_markup=types.ReplyKeyboardRemove())
 
-    if data.startswith("change_name_"):
-        server_id = data.split("_")[2]
-        user_states[user_id] = f'changing_name_{server_id}'
-        await callback_query.message.edit_text("✏️ Enter new name:", reply_markup=cancel_back_keyboard())
-        return
-
-    if data.startswith("change_username_"):
-        server_id = data.split("_")[2]
-        user_states[user_id] = f'changing_username_{server_id}'
-        await callback_query.message.edit_text("👤 Enter new username:", reply_markup=cancel_back_keyboard())
-        return
-
-    if data.startswith("delete_"):
-        server_id = data.split("_")[1]
-        delete_server_by_id(server_id)
-        await callback_query.message.edit_text("🗑️ Server deleted.", reply_markup=server_list_keyboard())
-        return
-
-    if data.startswith("info_"):
-        server_id = data.split("_")[1]
-        server = get_server_by_id(server_id)
-        if not server:
-            await callback_query.message.edit_text("❌ Server not found.", reply_markup=server_list_keyboard())
-            return
-
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            key = paramiko.RSAKey.from_private_key_file(server['key_file'])
-            ssh.connect(server['ip'], username=server['username'], pkey=key)
-
-            stdin, stdout, stderr = ssh.exec_command("uname -a")
-            os_info = stdout.read().decode().strip()
-
-            stdin, stdout, stderr = ssh.exec_command("uptime -p")
-            uptime = stdout.read().decode().strip()
-
-            stdin, stdout, stderr = ssh.exec_command("free -m")
-            ram = stdout.read().decode().strip()
-
-            stdin, stdout, stderr = ssh.exec_command("df -h /")
-            disk = stdout.read().decode().strip()
-
-            ssh.close()
-
-            info = f"<b>👤 User:</b> {server['username']}\n<b>🌐 IP:</b> {server['ip']}\n<b>🖥️ OS:</b> {os_info}\n<b>⏱️ Uptime:</b> {uptime}\n\n<pre>{ram}</pre>\n<pre>{disk}</pre>"
-            await callback_query.message.edit_text(info, parse_mode='HTML', reply_markup=server_action_keyboard(server_id))
-        except Exception as e:
-            await callback_query.message.edit_text(f"❌ Error fetching server info:\n{e}", reply_markup=server_action_keyboard(server_id))
-        return
-
-    await callback_query.answer()
-
-
-@dp.message_handler()
-async def handle_messages(message: types.Message):
-    user_id = message.from_user.id
-    state = user_states.get(user_id)
-
-    if not state:
-        return await message.answer("❓ Please use /start to begin.")
-
-    if state == 'adding_name':
-        temp_server_data[user_id]['name'] = message.text
-        user_states[user_id] = 'adding_username'
-        return await message.answer("👤 Enter username:", reply_markup=cancel_back_keyboard())
-
-    if state == 'adding_username':
-        temp_server_data[user_id]['username'] = message.text
-        user_states[user_id] = 'adding_ip'
-        return await message.answer("🌐 Enter IP address:", reply_markup=cancel_back_keyboard())
-
-    if state == 'adding_ip':
-        temp_server_data[user_id]['ip'] = message.text
-        user_states[user_id] = 'adding_key'
-        return await message.answer("📂 Send SSH private key file:", reply_markup=cancel_back_keyboard())
-
-    if state.startswith("changing_name_"):
-        server_id = state.split("_")[2]
-        update_server_name(server_id, message.text)
-        user_states.pop(user_id, None)
-        await message.answer("✅ Name updated.", reply_markup=server_list_keyboard())
-        return
-
-    if state.startswith("changing_username_"):
-        server_id = state.split("_")[2]
-        update_server_username(server_id, message.text)
-        user_states.pop(user_id, None)
-        await message.answer("✅ Username updated.", reply_markup=server_list_keyboard())
-        return
-
+    if step == 'name':
+        state['name'] = message.text
+        state['step'] = 'username'
+        await message.answer("👤 Enter SSH username:")
+    elif step == 'username':
+        state['username'] = message.text
+        state['step'] = 'ip'
+        await message.answer("📡 Enter server IP address:")
+    elif step == 'ip':
+        state['ip'] = message.text
+        state['step'] = 'pkey'
+        await message.answer("📎 Send the private key file (.pem):")
+    else:
+        await message.answer("❌ Unexpected step. Send /cancel to restart.")
 
 @dp.message_handler(content_types=types.ContentType.DOCUMENT)
-async def handle_document(message: types.Message):
-    user_id = message.from_user.id
-    if user_states.get(user_id) != 'adding_key':
+async def handle_pkey_file(message: types.Message):
+    uid = message.from_user.id
+    state = user_state.get(uid)
+    if not state or state.get('step') != 'pkey':
         return
 
     doc = message.document
-    file_path = f"ssh_keys/{doc.file_name}"
+    if not doc.file_name.endswith(".pem"):
+        return await message.answer("❌ Invalid file. Must be .pem format.")
+
+    file_path = f"/tmp/{doc.file_name}"
     await doc.download(destination_file=file_path)
 
-    temp = temp_server_data[user_id]
+    await message.answer("⏳ Testing SSH connection...")
+    access = await is_ssh_accessible(state['ip'], state['username'], file_path)
 
-    try:
-        key = paramiko.RSAKey.from_private_key_file(file_path)
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(temp['ip'], username=temp['username'], pkey=key)
-        ssh.close()
-    except Exception as e:
-        await message.answer(f"❌ SSH connection failed: {e}", reply_markup=cancel_back_keyboard())
-        return
+    if not access:
+        return await message.answer("❌ SSH login failed. Check key/IP/username and try again.")
 
-    temp['key_file'] = file_path
-    add_server(temp)
-    user_states.pop(user_id, None)
-    temp_server_data.pop(user_id, None)
-    await message.answer("✅ Server added successfully!", reply_markup=server_list_keyboard())
+    add_server({
+        'name': state['name'],
+        'username': state['username'],
+        'ip': state['ip'],
+        'pkey': file_path
+    })
+    user_state.pop(uid, None)
+    await message.answer("✅ Server added successfully!")
+    await show_main_menu(message)
 
+# Server Selected
+@dp.callback_query_handler(lambda c: c.data.startswith("server:"))
+async def handle_server_selected(callback: types.CallbackQuery):
+    sid = callback.data.split(":")[1]
+    server = get_server_by_id(sid)
+    if not server:
+        return await callback.message.edit_text("❌ Server not found.")
+
+    # Simulate info
+    info = f"🖥️ <b>Server Info: {server['name']}</b>\n\n"
+    info += f"👤 <b>User:</b> {server['username']}\n"
+    info += f"📡 <b>IP:</b> {server['ip']}\n"
+    info += f"💻 <b>OS:</b> Ubuntu 22.04 LTS\n"
+    info += f"⏱️ <b>Uptime:</b> 3 days, 5 hours\n\n"
+    info += f"📊 <b>Resources:</b>\n🔋 RAM: 8 GB | 3.2 GB used\n💽 Disk: 100 GB | 55 GB used\n🧠 CPU: 18%\n"
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🗂️ File Manager", callback_data=f"file:{sid}"),
+        InlineKeyboardButton("🤖 Bot Manager", callback_data=f"bot:{sid}")
+    )
+    kb.add(InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{sid}"))
+    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="back"))
+
+    await callback.message.edit_text(info, reply_markup=kb)
+
+# Edit Server Menu
+@dp.callback_query_handler(lambda c: c.data.startswith("edit:"))
+async def edit_server(callback: types.CallbackQuery):
+    sid = callback.data.split(":")[1]
+    server = get_server_by_id(sid)
+    if not server:
+        return await callback.message.edit_text("❌ Server not found.")
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📝 Change Name", callback_data=f"rename:{sid}"),
+        InlineKeyboardButton("👤 Change Username", callback_data=f"reuser:{sid}")
+    )
+    kb.add(InlineKeyboardButton("🗑️ Delete Server", callback_data=f"delete_confirm:{sid}"))
+    kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"server:{sid}"))
+
+    await callback.message.edit_text(f"✏️ Edit Server: <b>{server['name']}</b>", reply_markup=kb)
+
+# Delete Confirmation
+@dp.callback_query_handler(lambda c: c.data.startswith("delete_confirm:"))
+async def confirm_delete(callback: types.CallbackQuery):
+    sid = callback.data.split(":")[1]
+    server = get_server_by_id(sid)
+    if not server:
+        return await callback.message.edit_text("❌ Server not found.")
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("✅ Yes, delete", callback_data=f"delete:{sid}"))
+    kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"server:{sid}"))
+
+    await callback.message.edit_text(f"⚠️ Are you sure you want to delete <b>{server['name']}</b>?", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("delete:"))
+async def do_delete(callback: types.CallbackQuery):
+    sid = callback.data.split(":")[1]
+    delete_server_by_id(sid)
+    await callback.message.edit_text("✅ Server deleted.")
+    await asyncio.sleep(1)
+    await show_main_menu(callback)
+
+# Rename
+@dp.callback_query_handler(lambda c: c.data.startswith("rename:"))
+async def rename_server(callback: types.CallbackQuery):
+    sid = callback.data.split(":")[1]
+    user_state[callback.from_user.id] = {'rename': sid}
+    await callback.message.edit_text("📝 Send new name:\n/cancel to abort")
+
+@dp.message_handler(lambda m: m.from_user.id in user_state and 'rename' in user_state[m.from_user.id])
+async def handle_rename(message: types.Message):
+    sid = user_state[message.from_user.id]['rename']
+    update_server_name(sid, message.text)
+    user_state.pop(message.from_user.id)
+    await message.answer("✅ Server name updated.")
+    await show_main_menu(message)
+
+# Reuser
+@dp.callback_query_handler(lambda c: c.data.startswith("reuser:"))
+async def reuser_server(callback: types.CallbackQuery):
+    sid = callback.data.split(":")[1]
+    user_state[callback.from_user.id] = {'reuser': sid}
+    await callback.message.edit_text("👤 Send new username:\n/cancel to abort")
+
+@dp.message_handler(lambda m: m.from_user.id in user_state and 'reuser' in user_state[m.from_user.id])
+async def handle_reuser(message: types.Message):
+    sid = user_state[message.from_user.id]['reuser']
+    update_server_username(sid, message.text)
+    user_state.pop(message.from_user.id)
+    await message.answer("✅ Server username updated.")
+    await show_main_menu(message)
+
+# Cancel
+@dp.callback_query_handler(lambda c: c.data == "back")
+async def cancel_back(callback: types.CallbackQuery):
+    await show_main_menu(callback)
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
-
-
