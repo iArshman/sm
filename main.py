@@ -5,7 +5,7 @@ import os
 import platform
 import paramiko
 import psutil
-import uptime
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
