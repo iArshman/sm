@@ -16,7 +16,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 
 from config import BOT_TOKEN, ADMIN_IDS
 from db import (add_server, delete_server_by_id, get_servers,
-                update_server_name, update_server_username, get_server)
+                update_server_name, update_server_username, get_server_by_id)
 
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML, session=AiohttpSession())
 dp = Dispatcher()
@@ -104,7 +104,7 @@ def edit_menu(server_id):
 
 @dp.message()
 async def handle_start(message: types.Message):
-    if str(message.from_user.id) != str(ADMIN_ID):
+    if message.from_user.id not in ADMIN_IDS:
         return await message.answer("⛔ Unauthorized")
     await message.answer("<b>🔧 Server Manager</b>", reply_markup=main_menu())
 
@@ -122,7 +122,7 @@ async def handle_callback(query: types.CallbackQuery):
 
     elif data.startswith("server:"):
         server_id = data.split(":")[1]
-        server = get_server(server_id)
+        server = get_server_by_id(server_id)
         if not server:
             return await query.message.edit_text("❌ Server not found", reply_markup=main_menu())
         await query.message.edit_text(f"<b>🖥 {server['name']} Menu</b>", reply_markup=server_menu(server_id))
@@ -148,7 +148,7 @@ async def handle_callback(query: types.CallbackQuery):
 
     elif data.startswith("info:"):
         server_id = data.split(":")[1]
-        server = get_server(server_id)
+        server = get_server_by_id(server_id)
         if not server:
             return await query.message.edit_text("❌ Server not found", reply_markup=main_menu())
 
@@ -225,7 +225,12 @@ async def handle_key_file(message: Message):
         os.remove(path)
         return await message.answer("❌ SSH connection failed. Please try again.", reply_markup=main_menu())
 
-    add_server(session['name'], session['username'], session['ip'], path)
+    add_server({
+        "name": session['name'],
+        "username": session['username'],
+        "ip": session['ip'],
+        "key_path": path
+    })
     user_sessions.pop(user_id)
     await message.answer("✅ Server added successfully", reply_markup=main_menu())
 
