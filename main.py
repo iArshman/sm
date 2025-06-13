@@ -14,6 +14,8 @@ from db import (
     update_server_username,
     delete_server_by_id
 )
+from bson.objectid import ObjectId
+from bson.errors import InvalidId
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +31,22 @@ def cancel_button():
 
 def back_button(to):
     return InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=to))
+
+# Convert seconds to human-readable uptime (e.g., "2 days, 3 hours")
+def format_uptime(seconds):
+    if not isinstance(seconds, (int, float)) or seconds < 0:
+        return "Unknown"
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    return ", ".join(parts) or "Less than a minute"
 
 # --- TEMP STATE ---
 user_input = {}
@@ -77,19 +95,44 @@ def get_remote_stats(server_id, ip, username, key_content):
     try:
         ssh = get_ssh_session(server_id, ip, username, key_content)
 
-        # Get OS info
-        stdin, stdout, stderr = ssh.exec_command("uname -sr")
-        os_info = stdout.read().decode().strip() or "Unknown"
-        stderr_output = stderr.read().decode().strip()
-        if stderr_output:
-            logger.warning(f"OS command error: {stderr_output}")
+        # Get OS info (distribution and kernel)
+        os_info = "Unknown"
+        try:
+            stdin, stdout, stderr = ssh.exec_command("cat /etc/os-release")
+            os_release = stdout.read().decode().strip()
+            stderr_output = stderr.read().decode().strip()
+            if stderr_output:
+                logger.warning(f"OS release command error: {stderr_output}")
+            os_dict = {}
+            for line in os_release.splitlines():
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    os_dict[key.strip()] = value.strip().strip('"')
+            distro = os_dict.get('PRETTY_NAME', 'Unknown')
 
-        # Get uptime
-        stdin, stdout, stderr = ssh.exec_command("uptime -p")
-        uptime = stdout.read().decode().strip().replace("up ", "") or "Unknown"
-        stderr_output = stderr.read().decode().strip()
-        if stderr_output:
-            logger.warning(f"Uptime command error: {stderr_output}")
+            stdin, stdout, stderr = ssh.exec_command("uname -r")
+            kernel = stdout.read().decode().strip() or "Unknown"
+            stderr_output = stderr.read().decode().strip()
+            if stderr_output:
+                logger.warning(f"Kernel command error: {stderr_output}")
+            os_info = f"{distro}, Kernel {kernel}"
+            logger.debug(f"OS info: {os_info}")
+        except Exception as e:
+            logger.error(f"OS info parsing error: {e}")
+
+        # Get uptime (from /proc/uptime)
+        uptime = "Unknown"
+        try:
+            stdin, stdout, stderr = ssh.exec_command("cat /proc/uptime")
+            uptime_data = stdout.read().decode().strip()
+            stderr_output = stderr.read().decode().strip()
+            if stderr_output:
+                logger.warning(f"Uptime command error: {stderr_output}")
+            uptime_seconds = float(uptime_data.split()[0])
+            uptime = format_uptime(uptime_seconds)
+            logger.debug(f"Uptime: {uptime} ({uptime_seconds} seconds)")
+        except (IndexError, ValueError) as e:
+            logger.error(f"Uptime parsing error: {e}")
 
         # Get memory (total and used in GB)
         ram_total = ram_used = "Unknown"
@@ -260,14 +303,14 @@ async def handle_key_upload(message: types.Message):
                     ssh_key = paramiko.ECDSAKey.from_private_key(key_file)
                 except paramiko.SSHException:
                     key_file.seek(0)
-                    ssh_key = paramiko.Ed25519Key.from_private_key(key_file)
-
-            if not ssh_key:
-                raise paramiko.SSHException("Invalid key format")
+                    try:
+                        ssh_key = paramiko.Ed25519Key.from_private_key(key_file)
+                    except paramiko.SSHException:
+                        raise ValueError("Invalid key format")
 
             ssh.connect(data['ip'], username=data['username'], pkey=ssh_key, timeout=10)
             ssh.close()
-            # Clear any existing session for this server if re-adding
+            # Clear any existing session for this server if re-added
             if str(data.get('_id')) in active_sessions:
                 try:
                     active_sessions[str(data.get('_id'))].close()
@@ -277,7 +320,10 @@ async def handle_key_upload(message: types.Message):
             await add_server(data)
             # Establish session immediately after adding
             server_id = str((await get_servers())[-1]['_id'])
-            get_ssh_session(server_id, data['ip'], data['username'], key_content)
+            try:
+                get_ssh_session(server_id, data['ip'], data['username'], key_content)
+            except Exception as e:
+                logger.error(f"Failed to establish session for new server {server_id}: {e}")
             await message.answer("✅ Server added successfully!")
         except Exception as e:
             logger.error(f"SSH connection failed for {data['ip']}: {e}")
@@ -293,37 +339,36 @@ async def handle_key_upload(message: types.Message):
 @dp.callback_query_handler(lambda c: c.data.startswith("server_"))
 async def view_server(callback: types.CallbackQuery):
     try:
-        server_id = callback.data.split("_")[1]
+        server_id = callback.data.split('_')[1]
         server = await get_server_by_id(server_id)
         if not server:
             await callback.message.edit_text("❌ Server not found.")
             return
-
+        logger.info(f"Viewing server {server_id}: {server['name']}")
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
-            InlineKeyboardButton("🗂 File Manager", callback_data=f"file_{server_id}"),
+            InlineKeyboardButton("🗂 File Manager", callback_data=f"file_manager_{server_id}"),
             InlineKeyboardButton("📊 Server Info", callback_data=f"info_{server_id}"),
-            InlineKeyboardButton("🤖 Bot Manager", callback_data=f"bot_{server_id}"),
-            InlineKeyboardButton("✏️ Edit", callback_data=f"edit_{server_id}"),
+            InlineKeyboardButton("🤖 Bot Manager", callback_data=f"bot_manager_{server_id}"),
+            InlineKeyboardButton("✏ Edit", callback_data=f"edit_{server_id}"),
         )
-        kb.add(InlineKeyboardButton("⬅️ Back", callback_data="start"))
+        kb.add(InlineKeyboardButton("⬅ Back", callback_data="start"))
         await callback.message.edit_text(f"🖥 <b>{server['name']}</b>", parse_mode='HTML', reply_markup=kb)
     except Exception as e:
-        logger.error(f"View server error: {e}")
+        logger.error(f"View server error for {server_id}: {e}")
         await callback.message.edit_text("❌ Error loading server details.")
 
 # --- SERVER INFO ---
 @dp.callback_query_handler(lambda c: c.data.startswith("info_"))
 async def server_info(callback: types.CallbackQuery):
     try:
-        server_id = callback.data.split("_")[1]
+        server_id = callback.data.split('_')[1]
         server = await get_server_by_id(server_id)
         if not server:
             await callback.message.edit_text("❌ Server not found.")
             return
-
         await callback.message.edit_text("📊 Fetching server stats...", parse_mode="HTML")
-        stats = get_remote_stats(server_id, server['ip'], server['username'], server['key_content'])
+        stats = get_server_info(server_id, server['ip'], server['username'], server['key_content'])
         if stats.get('error'):
             text = (
                 f"🖥 <b>{server['name']}</b>\n"
@@ -363,15 +408,15 @@ async def bot_manager(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_"))
 async def edit_server(callback: types.CallbackQuery):
     try:
-        server_id = callback.data.split("_")[1]
+        server_id = callback.data.split('_')[1]
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
-            InlineKeyboardButton("✏️ Rename", callback_data=f"rename_{server_id}"),
+            InlineKeyboardButton("✏ Rename", callback_data=f"rename_{server_id}"),
             InlineKeyboardButton("👤 Change Username", callback_data=f"reuser_{server_id}"),
             InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{server_id}"),
         )
-        kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"server_{server_id}"))
-        await callback.message.edit_text("✏️ Edit Server", parse_mode='HTML', reply_markup=kb)
+        kb.add(InlineKeyboardButton("⬅ Back", callback_data=f"server_{server_id}"))
+        await callback.message.edit_text("✏ Edit Server", parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         logger.error(f"Edit server error: {e}")
         await callback.message.edit_text("❌ Error loading edit menu.")
@@ -380,9 +425,9 @@ async def edit_server(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("rename_"))
 async def rename_server(callback: types.CallbackQuery):
     try:
-        sid = callback.data.split("_")[1]
+        sid = callback.data.split('_')[1]
         user_input[callback.from_user.id] = {'edit': 'name', 'id': sid}
-        await bot.send_message(callback.from_user.id, "✏️ Enter new name:", reply_markup=cancel_button())
+        await bot.send_message(callback.from_user.id, "✏ Enter new name:", reply_markup=cancel_button())
     except Exception as e:
         logger.error(f"Rename server error: {e}")
         await callback.message.edit_text("❌ Error initiating rename.")
@@ -391,7 +436,7 @@ async def rename_server(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("reuser_"))
 async def change_username(callback: types.CallbackQuery):
     try:
-        sid = callback.data.split("_")[1]
+        sid = callback.data.split('_')[1]
         user_input[callback.from_user.id] = {'edit': 'username', 'id': sid}
         await bot.send_message(callback.from_user.id, "👤 Enter new username:", reply_markup=cancel_button())
     except Exception as e:
@@ -403,31 +448,43 @@ async def change_username(callback: types.CallbackQuery):
 async def confirm_delete(callback: types.CallbackQuery):
     try:
         logger.info(f"Delete callback data: {callback.data}")
-        if not callback.data.startswith("delete_"):
-            raise ValueError("Invalid delete callback data")
-        sid = callback.data.split("_")[1]
+        parts = callback.data.split('_')
+        if len(parts) != 2 or parts[0] != 'delete':
+            raise ValueError(f"Invalid delete callback data: {callback.data}")
+        sid = parts[1]
+        try:
+            ObjectId(sid)  # Validate ObjectId
+        except InvalidId:
+            raise ValueError(f"Invalid server ID: {sid}")
         server = await get_server_by_id(sid)
         if not server:
             raise ValueError(f"Server {sid} not found")
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
             InlineKeyboardButton("✅ Yes, delete", callback_data=f"delete_confirm_{sid}"),
-            InlineKeyboardButton("⬅️ Back", callback_data=f"edit_{sid}")
+            InlineKeyboardButton("⬅ Back", callback_data=f"edit_{sid}")
         )
-        await callback.message.edit_text(f"⚠️ Are you sure you want to delete server '{server['name']}'?", reply_markup=kb)
+        await callback.message.edit_text(f"⚠ Are you sure you want to delete server '{server['name']}'?", reply_markup=kb)
     except Exception as e:
         logger.error(f"Confirm delete error: {e}")
         try:
-            await callback.message.edit_text("❌ Error initiating delete.")
+            await callback.message.edit_text(f"❌ Error initiating delete: {str(e)}")
         except:
-            await bot.send_message(callback.from_user.id, "❌ Error initiating delete.")
+            await bot.send_message(callback.from_user.id, f"❌ Error initiating delete: {str(e)}")
 
 # --- DELETE CONFIRM ---
 @dp.callback_query_handler(lambda c: c.data.startswith("delete_confirm_"))
 async def delete_confirm(callback: types.CallbackQuery):
     try:
         logger.info(f"Delete confirm callback data: {callback.data}")
-        sid = callback.data.split("_")[2]
+        parts = callback.data.split('_')
+        if len(parts) != 3 or parts[0] != 'delete' or parts[1] != 'confirm':
+            raise ValueError(f"Invalid delete confirm callback data: {callback.data}")
+        sid = parts[2]
+        try:
+            ObjectId(sid)  # Validate ObjectId
+        except InvalidId:
+            raise ValueError(f"Invalid server ID: {sid}")
         server = await get_server_by_id(sid)
         if not server:
             raise ValueError(f"Server {sid} not found")
@@ -444,9 +501,9 @@ async def delete_confirm(callback: types.CallbackQuery):
     except Exception as e:
         logger.error(f"Delete confirm error: {e}")
         try:
-            await callback.message.edit_text("❌ Error deleting server.")
+            await callback.message.edit_text(f"❌ Error deleting server: {str(e)}")
         except:
-            await bot.send_message(callback.from_user.id, "❌ Error deleting server.")
+            await bot.send_message(callback.from_user.id, f"❌ Error deleting server: {str(e)}")
 
 # --- HANDLE RENAME/USERNAME INPUTS ---
 @dp.message_handler(lambda message: message.from_user.id in user_input and user_input[message.from_user.id].get('edit') in ['name', 'username'])
@@ -468,7 +525,7 @@ async def handle_renames(message: types.Message):
             await message.answer("✅ Username updated.")
     except Exception as e:
         logger.error(f"Error updating {edit_type} for server {sid}: {e}")
-        await message.answer(f"❌ Error updating {edit_type}. Please try again.")
+        await message.answer(f"❌ Error updating {edit_type}: {str(e)}")
     finally:
         user_input.pop(uid, None)
         await start(message)
