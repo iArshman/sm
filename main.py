@@ -10,22 +10,21 @@ logging.basicConfig(
 )
 
 async def start(update, context):
-    # This will show persistent buttons at the bottom of the chat
     await update.message.reply_text(
-        "Welcome to Server Manager!",
+        "🖥️ *Server Manager*\n\n"
+        "Manage your servers with ease!",
+        parse_mode='Markdown',
         reply_markup=ReplyKeyboardMarkup(
-            [['My Servers', 'Add Server']],  # Two buttons in one row
-            resize_keyboard=True,  # Makes buttons smaller to fit
-            one_time_keyboard=False  # Buttons stay until replaced
+            [['📋 My Servers', '➕ Add Server']],
+            resize_keyboard=True,
+            input_field_placeholder="Choose an option..."
         )
     )
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
-    
     application.add_handler(CommandHandler("start", start))
     setup_handlers(application)
-    
     application.run_polling()
 
 if __name__ == '__main__':
