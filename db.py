@@ -1,30 +1,24 @@
 from pymongo import MongoClient
-from config import MONGO_URI
+from bson import ObjectId
 
-client = MongoClient(MONGO_URI)
-db = client['server_manager']
-servers = db['servers']
+client = MongoClient("mongodb://localhost:27017/")
+db = client["server_manager"]
+servers_collection = db["servers"]
 
-def add_server(user_id, name, username, ip, key_file_path):
-    servers.insert_one({
-        'user_id': user_id,
-        'name': name,
-        'username': username,
-        'ip': ip,
-        'key_file_path': key_file_path
-    })
+def add_server(data):
+    servers_collection.insert_one(data)
 
-def get_servers(user_id):
-    return list(servers.find({'user_id': user_id}))
+def get_servers():
+    return list(servers_collection.find())
 
-def get_server_by_name(user_id, name):
-    return servers.find_one({'user_id': user_id, 'name': name})
+def get_server_by_id(server_id):
+    return servers_collection.find_one({"_id": ObjectId(server_id)})
 
-def update_server_name(user_id, old_name, new_name):
-    servers.update_one({'user_id': user_id, 'name': old_name}, {'$set': {'name': new_name}})
+def update_server_name(server_id, new_name):
+    servers_collection.update_one({"_id": ObjectId(server_id)}, {"$set": {"name": new_name}})
 
-def update_server_username(user_id, name, new_username):
-    servers.update_one({'user_id': user_id, 'name': name}, {'$set': {'username': new_username}})
+def update_server_username(server_id, new_username):
+    servers_collection.update_one({"_id": ObjectId(server_id)}, {"$set": {"username": new_username}})
 
-def delete_server(user_id, name):
-    servers.delete_one({'user_id': user_id, 'name': name})
+def delete_server_by_id(server_id):
+    servers_collection.delete_one({"_id": ObjectId(server_id)})
