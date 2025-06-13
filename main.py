@@ -1,8 +1,6 @@
 from telegram import ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler
 from server import setup_handlers
-from file import setup_handlers as setup_file_handlers
-from botmanager import setup_handlers as setup_bot_handlers
 from config import BOT_TOKEN
 import logging
 
@@ -12,19 +10,21 @@ logging.basicConfig(
 )
 
 async def start(update, context):
+    # This will show persistent buttons at the bottom of the chat
     await update.message.reply_text(
-        "🚀 Server Management Bot",
-        reply_markup=ReplyKeyboardMarkup([['My Servers']], resize_keyboard=True)
+        "Welcome to Server Manager!",
+        reply_markup=ReplyKeyboardMarkup(
+            [['My Servers', 'Add Server']],  # Two buttons in one row
+            resize_keyboard=True,  # Makes buttons smaller to fit
+            one_time_keyboard=False  # Buttons stay until replaced
+        )
     )
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Register handlers
     application.add_handler(CommandHandler("start", start))
     setup_handlers(application)
-    setup_file_handlers(application)
-    setup_bot_handlers(application)
     
     application.run_polling()
 
