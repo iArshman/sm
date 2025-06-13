@@ -17,6 +17,7 @@ from db import (
 from bson.objectid import ObjectId
 from bson.errors import InvalidId
 from file_manager import init_file_manager
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -114,15 +115,29 @@ def get_remote_stats(server_id, ip, username, key_content):
             logger.error(f"OS info parsing error: {e}")
         uptime = "Unknown"
         try:
-            stdin, stdout, stderr = ssh.exec_command("cat /proc/uptime")
-            uptime_data = stdout.read().decode().strip()
+            # Try uptime -s for boot time
+            stdin, stdout, stderr = ssh.exec_command("uptime -s")
+            boot_time = stdout.read().decode().strip()
             stderr_output = stderr.read().decode().strip()
-            if stderr_output:
-                logger.warning(f"Uptime command error: {stderr_output}")
-            uptime_seconds = float(uptime_data.split()[0])
+            if not stderr_output and boot_time:
+                boot_dt = datetime.strptime(boot_time, "%Y-%m-%d %H:%M:%S")
+                uptime_seconds = (datetime.now() - boot_dt).total_seconds()
+                logger.debug(f"Boot time: {boot_time}, Uptime: {uptime_seconds} seconds")
+            else:
+                # Fallback to /proc/uptime
+                logger.warning(f"Uptime -s failed: {stderr_output}, falling back to /proc/uptime")
+                stdin, stdout, stderr = ssh.exec_command("cat /proc/uptime")
+                uptime_data = stdout.read().decode().strip()
+                stderr_output = stderr.read().decode().strip()
+                logger.debug(f"/proc/uptime output: {uptime_data}")
+                if stderr_output:
+                    logger.warning(f"Uptime command error: {stderr_output}")
+                uptime_seconds = float(uptime_data.split()[0])
+            if uptime_seconds < 0 or uptime_seconds > 1e9:  # Validate reasonable range
+                raise ValueError(f"Invalid uptime seconds: {uptime_seconds}")
             uptime = format_uptime(uptime_seconds)
             logger.debug(f"Uptime: {uptime} ({uptime_seconds} seconds)")
-        except (IndexError, ValueError) as e:
+        except (IndexError, ValueError, Exception) as e:
             logger.error(f"Uptime parsing error: {e}")
         ram_total = ram_used = "Unknown"
         try:
@@ -414,8 +429,8 @@ async def change_username(callback: types.CallbackQuery):
         logger.error(f"Change username error: {e}")
         await callback.message.edit_text("❌ Error initiating username change.")
 
-# --- DELETE SERVER ---
-@dp.callback_query_handler(lambda c: c.data.startswith("delete_"))
+# --- DELETE SERVER CONFIRMATION ---
+@dp.callback_query_handler(lambda c: c.data.startswith("delete_") and not c.data.startswith("delete_confirm_"))
 async def confirm_delete(callback: types.CallbackQuery):
     try:
         logger.info(f"Delete callback data: {callback.data}")
