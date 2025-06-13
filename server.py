@@ -1,5 +1,5 @@
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
-from telegram.ext import MessageHandler, Filters, CallbackQueryHandler, ConversationHandler
+from telegram.ext import MessageHandler, filters, CallbackQueryHandler, ConversationHandler
 from db import db
 import time
 
@@ -7,7 +7,7 @@ import time
 EDIT_CHOOSE, EDIT_NAME, EDIT_IP, EDIT_USER = range(4)
 
 def setup_handlers(dp):
-    dp.add_handler(MessageHandler(Filters.regex('^My Servers$'), list_servers))
+    dp.add_handler(MessageHandler(filters.regex('^My Servers$'), list_servers))
     dp.add_handler(CallbackQueryHandler(handle_action, pattern='^srv:'))
     
     # Edit server conversation
@@ -15,9 +15,9 @@ def setup_handlers(dp):
         entry_points=[CallbackQueryHandler(start_edit, pattern='^srv:edit:')],
         states={
             EDIT_CHOOSE: [CallbackQueryHandler(choose_edit_field)],
-            EDIT_NAME: [MessageHandler(Filters.text, save_name)],
-            EDIT_IP: [MessageHandler(Filters.text, save_ip)],
-            EDIT_USER: [MessageHandler(Filters.text, save_user)]
+            EDIT_NAME: [MessageHandler(filters.text, save_name)],
+            EDIT_IP: [MessageHandler(filters.text, save_ip)],
+            EDIT_USER: [MessageHandler(filters.text, save_user)]
         },
         fallbacks=[]
     )
