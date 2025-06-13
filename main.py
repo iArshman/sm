@@ -1,6 +1,6 @@
 from telegram.ext import Updater, CommandHandler
 from server import setup_handlers
-from file import setup_handlers as setup_file_handlers
+from files import setup_handlers as setup_file_handlers
 from botmanager import setup_handlers as setup_bot_handlers
 from config import BOT_TOKEN
 import logging
