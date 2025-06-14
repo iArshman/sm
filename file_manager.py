@@ -257,10 +257,21 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         await callback.answer()
         try:
             _, server_id, _ = parse_callback_data(callback.data)
+            from main import get_ssh_session, get_server_by_id  # Delayed import
+            # Check if session exists, otherwise attempt to create it
             if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
+                server = await get_server_by_id(server_id)
+                if not server:
+                    logger.error(f"Server {server_id} not found")
+                    await callback.message.edit_text("❌ Server not found.", reply_markup=back_button(f"server_{server_id}"))
+                    return
+                try:
+                    ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+                    active_sessions[server_id] = ssh  # Store the new session
+                except Exception as e:
+                    logger.error(f"Failed to establish SSH session for server {server_id}: {e}")
+                    await callback.message.edit_text("❌ Failed to establish SSH session.", reply_markup=back_button(f"server_{server_id}"))
+                    return
             user_input[callback.from_user.id] = {
                 'server_id': server_id,
                 'current_path': '/home/ubuntu',
