@@ -6,13 +6,15 @@ import base64
 from aiogram import Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from datetime import datetime
-from main import get_ssh_session, get_server_by_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def back_button(callback_data):
+    return InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=callback_data))
+
 def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
-    @dp.callback_query_handler(lambda c: c.data.startswith(("fm_", "file_", "select_", "zip_", "unzip_")))
+    @dp.callback_query_handler(lambda c: c.data.startswith(("fm_", "file_", "select_", "zip_", "unzip_", "download_", "delete_", "upload_", "download_selected_", "delete_selected_")))
     async def handle_file_actions(callback: types.CallbackQuery):
         try:
             data = callback.data.split("_")
@@ -27,19 +29,15 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
                 await callback.message.edit_text("❌ Invalid path encoding.")
                 return
 
-            # Get server details and initialize SSH session
-            server = await get_server_by_id(server_id)
-            logger.debug(f"Server lookup for server_id={server_id}: {server}")
-            if not server:
-                logger.error(f"Server not found for server_id={server_id}")
-                await callback.message.edit_text(f"❌ Server not found (ID: {server_id}).")
+            # Check SSH session
+            ssh = active_sessions.get(server_id)
+            if not ssh:
+                logger.error(f"No SSH session for server_id={server_id}")
+                await callback.message.edit_text("❌ No active SSH session. Please try again or check server configuration.")
                 return
-            try:
-                ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
-                logger.debug(f"SSH session initialized for server_id={server_id}, ip={server['ip']}")
-            except Exception as e:
-                logger.error(f"SSH session error for server {server_id} ({server['ip']}): {str(e)}")
-                await callback.message.edit_text(f"❌ Failed to connect to {server['name']} ({server['ip']}): {str(e)}")
+            if not ssh.get_transport() or not ssh.get_transport().is_active():
+                logger.warning(f"SSH session inactive for server_id={server_id}")
+                await callback.message.edit_text("❌ SSH session disconnected. Please try again.")
                 return
 
             uid = callback.from_user.id
@@ -59,51 +57,52 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
             elif action == "unzip":
                 zip_path = base64.b64decode("_".join(data[2:])).decode('utf-8', errors='replace')
                 await unzip_file(callback, server_id, zip_path, current_path, user_input, ssh)
-            else:
-                file_path = base64.b64decode("_".join(data[1:])).decode('utf-8', errors='replace')
-                if action == "download":
-                    try:
-                        sftp = ssh.open_sftp()
-                        stat = sftp.stat(file_path)
-                        if stat.st_size > 50 * 1024 * 1024:
-                            await callback.message.edit_text("❌ File too large (>50MB) for Telegram.")
-                            sftp.close()
-                            return
-                        with sftp.file(file_path, 'rb') as remote_file:
-                            file_content = remote_file.read()
+            elif action == "download":
+                file_path = base64.b64decode("_".join(data[2:])).decode('utf-8', errors='replace')
+                try:
+                    sftp = ssh.open_sftp()
+                    stat = sftp.stat(file_path)
+                    if stat.st_size > 50 * 1024 * 1024:
+                        await callback.message.edit_text("❌ File too large (>50MB) for Telegram.")
                         sftp.close()
-                        file_io = io.BytesIO(file_content)
-                        file_io.name = os.path.basename(file_path)
-                        await callback.message.edit_text("📥 Downloading...")
-                        await bot.send_document(uid, file_io)
-                    except (paramiko.SFTPError, IOError) as e:
-                        logger.error(f"Download error for {file_path}: {e}")
-                        await callback.message.edit_text(f"❌ Download failed: {str(e)}")
-                elif action == "delete":
-                    try:
-                        sftp = ssh.open_sftp()
-                        is_dir = sftp.lstat(file_path).st_mode & 0o40000
-                        if is_dir:
-                            sftp.rmdir(file_path)
-                        else:
-                            sftp.remove(file_path)
-                        sftp.close()
-                        await callback.message.edit_text("🗑 File deleted.")
-                    except (paramiko.SFTPError, IOError) as e:
-                        logger.error(f"Delete error for {file_path}: {e}")
-                        await callback.message.edit_text(f"❌ Delete failed: {str(e)}")
-                elif action == "upload":
-                    user_input[uid] = {
-                        "server_id": server_id,
-                        "path": current_path,
-                        "action": "upload"
-                    }
-                    await callback.message.edit_text("📤 Please send the file to upload.", reply_markup=back_button(f"fm_{server_id}_{base64.b64encode(current_path.encode('utf-8')).decode()}"))
-                elif action == "download_selected":
-                    await download_selected(callback, server_id, user_input, ssh)
-                elif action == "delete_selected":
-                    await delete_selected(callback, server_id, user_input, ssh)
-                await list_files(callback.message, server_id, current_path, bot, user_input, ssh)
+                        return
+                    with sftp.file(file_path, 'rb') as remote_file:
+                        file_content = remote_file.read()
+                    sftp.close()
+                    file_io = io.BytesIO(file_content)
+                    file_io.name = os.path.basename(file_path)
+                    await callback.message.edit_text("📥 Downloading...")
+                    await bot.send_document(uid, file_io)
+                    await list_files(callback.message, server_id, current_path, bot, user_input, ssh)
+                except (paramiko.SFTPError, IOError) as e:
+                    logger.error(f"Download error for {file_path}: {e}")
+                    await callback.message.edit_text(f"❌ Download failed: {str(e)}")
+            elif action == "delete":
+                file_path = base64.b64decode("_".join(data[2:])).decode('utf-8', errors='replace')
+                try:
+                    sftp = ssh.open_sftp()
+                    is_dir = sftp.lstat(file_path).st_mode & 0o40000
+                    if is_dir:
+                        sftp.rmdir(file_path)
+                    else:
+                        sftp.remove(file_path)
+                    sftp.close()
+                    await callback.message.edit_text("🗑 File deleted.")
+                    await list_files(callback.message, server_id, current_path, bot, user_input, ssh)
+                except (paramiko.SFTPError, IOError) as e:
+                    logger.error(f"Delete error for {file_path}: {e}")
+                    await callback.message.edit_text(f"❌ Delete failed: {str(e)}")
+            elif action == "upload":
+                user_input[uid] = {
+                    "server_id": server_id,
+                    "path": current_path,
+                    "action": "upload"
+                }
+                await callback.message.edit_text("📤 Please send the file to upload.", reply_markup=back_button(f"fm_{server_id}_{base64.b64encode(current_path.encode('utf-8')).decode()}"))
+            elif action == "download_selected":
+                await download_selected(callback, server_id, user_input, ssh)
+            elif action == "delete_selected":
+                await delete_selected(callback, server_id, user_input, ssh)
         except Exception as e:
             logger.error(f"File action error: {str(e)}")
             await callback.message.edit_text(f"❌ Error: {str(e)}")
@@ -112,22 +111,15 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
     async def handle_file_upload(message: types.Message, active_sessions=active_sessions, user_input=user_input):
         uid = message.from_user.id
         if uid not in user_input or user_input[uid].get("action") != "upload":
+            logger.debug(f"Upload ignored: uid={uid}, user_input={user_input.get(uid)}")
             return
         server_id = user_input[uid]["server_id"]
         current_path = user_input[uid]["path"]
         try:
-            server = await get_server_by_id(server_id)
-            logger.debug(f"Upload server lookup for server_id={server_id}: {server}")
-            if not server:
-                logger.error(f"Server not found for server_id={server_id}")
-                await message.answer(f"❌ Server not found (ID: {server_id}).")
-                return
-            try:
-                ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
-                logger.debug(f"SSH session initialized for upload, server_id={server_id}, ip={server['ip']}")
-            except Exception as e:
-                logger.error(f"SSH session error for server {server_id} ({server['ip']}): {str(e)}")
-                await message.answer(f"❌ Failed to connect to {server['name']} ({server['ip']}): {str(e)}")
+            ssh = active_sessions.get(server_id)
+            if not ssh or not ssh.get_transport() or not ssh.get_transport().is_active():
+                logger.error(f"No active SSH session for server_id={server_id} during upload")
+                await message.answer("❌ No active SSH session. Please try again.")
                 return
             file = await bot.download_file_by_id(message.document.file_id)
             file_name = message.document.file_name
@@ -215,7 +207,7 @@ async def show_file_options(callback: types.CallbackQuery, server_id: str, file_
         await callback.message.edit_text(f"📄 <b>{os.path.basename(file_path)}</b>", parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logger.error(f"Show file options error: {e}")
-        await callback.message.edit_text(f"❌ Error: {str(e)}")
+        await message.edit_text(f"❌ Error: {str(e)}")
 
 async def toggle_select_mode(callback: types.CallbackQuery, server_id: str, current_path: str, user_input, ssh):
     uid = callback.from_user.id
@@ -256,6 +248,7 @@ async def download_selected(callback: types.CallbackQuery, server_id: str, user_
     user_input[uid]["selected_items"] = []
     user_input[uid]["select_mode"] = False
     await callback.message.edit_text("✅ Download complete.")
+    await list_files(callback.message, server_id, os.path.dirname(selected_items[0]), bot, user_input, ssh)
 
 async def delete_selected(callback: types.CallbackQuery, server_id: str, user_input, ssh):
     uid = callback.from_user.id
@@ -274,10 +267,11 @@ async def delete_selected(callback: types.CallbackQuery, server_id: str, user_in
             sftp.close()
         except (paramiko.SFTPError, IOError) as e:
             logger.error(f"Delete selected error for {file_path}: {e}")
-            await message.answer(f"❌ Failed to delete {os.path.basename(file_path)}: {str(e)}")
+            await callback.message.answer(f"❌ Failed to delete {os.path.basename(file_path)}: {str(e)}")
     user_input[uid]["selected_items"] = []
     user_input[uid]["select_mode"] = False
     await callback.message.edit_text("✅ Selected items deleted.")
+    await list_files(callback.message, server_id, os.path.dirname(selected_items[0]), bot, user_input, ssh)
 
 async def zip_selected(callback: types.CallbackQuery, server_id: str, current_path: str, user_input, ssh):
     uid = callback.from_user.id
