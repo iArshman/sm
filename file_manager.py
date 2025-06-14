@@ -1024,10 +1024,8 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             print(f"Error viewing file for server {current_path}: {s}")
             await callback.message.edit_text(f"Error viewing file: {str(e)}"", reply_callback=f"error_refresh_{file_name}")
 
-
-    # --- FILE DETAILS 
-
- @dp.callback_query_handler(lambda c: c.data.startswith('fm_details_'))
+    # --- FILE DETAILS ---
+    @dp.callback_query_handler(lambda c: c.data.startswith('fm_details_'))
     async def view_file_details(callback: types.CallbackQuery):
         try:
             parts = callback_data.split('_', maxsplit=3)
