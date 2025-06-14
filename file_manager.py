@@ -6,6 +6,7 @@ import base64
 from aiogram import Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from datetime import datetime
+from main import get_ssh_session, get_server_by_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
             data = callback.data.split("_")
             action = data[0]
             server_id = data[1]
+            logger.debug(f"File action callback: action={action}, server_id={server_id}, data={callback.data}")
             path_b64 = "_".join(data[2:]) if len(data) > 2 else ""
             try:
                 current_path = base64.b64decode(path_b64).decode('utf-8', errors='replace') if path_b64 else "/home/ubuntu"
@@ -24,9 +26,20 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
                 logger.error(f"Base64 decode error for path_b64={path_b64}: {e}")
                 await callback.message.edit_text("❌ Invalid path encoding.")
                 return
-            ssh = active_sessions.get(server_id)
-            if not ssh:
-                await callback.message.edit_text("❌ No active SSH session.")
+
+            # Get server details and initialize SSH session
+            server = await get_server_by_id(server_id)
+            logger.debug(f"Server lookup for server_id={server_id}: {server}")
+            if not server:
+                logger.error(f"Server not found for server_id={server_id}")
+                await callback.message.edit_text(f"❌ Server not found (ID: {server_id}).")
+                return
+            try:
+                ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+                logger.debug(f"SSH session initialized for server_id={server_id}, ip={server['ip']}")
+            except Exception as e:
+                logger.error(f"SSH session error for server {server_id} ({server['ip']}): {str(e)}")
+                await callback.message.edit_text(f"❌ Failed to connect to {server['name']} ({server['ip']}): {str(e)}")
                 return
 
             uid = callback.from_user.id
@@ -35,17 +48,17 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
                     user_input[uid] = {}
                 user_input[uid]["select_mode"] = False
                 user_input[uid]["selected_items"] = []
-                await list_files(callback.message, server_id, current_path, bot, user_input)
+                await list_files(callback.message, server_id, current_path, bot, user_input, ssh)
             elif action == "file":
                 file_path = base64.b64decode("_".join(data[2:])).decode('utf-8', errors='replace')
-                await show_file_options(callback, server_id, file_path, user_input)
+                await show_file_options(callback, server_id, file_path, user_input, ssh)
             elif action == "select":
-                await toggle_select_mode(callback, server_id, current_path, user_input)
+                await toggle_select_mode(callback, server_id, current_path, user_input, ssh)
             elif action == "zip":
-                await zip_selected(callback, server_id, current_path, user_input)
+                await zip_selected(callback, server_id, current_path, user_input, ssh)
             elif action == "unzip":
                 zip_path = base64.b64decode("_".join(data[2:])).decode('utf-8', errors='replace')
-                await unzip_file(callback, server_id, zip_path, current_path, user_input)
+                await unzip_file(callback, server_id, zip_path, current_path, user_input, ssh)
             else:
                 file_path = base64.b64decode("_".join(data[1:])).decode('utf-8', errors='replace')
                 if action == "download":
@@ -87,10 +100,10 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
                     }
                     await callback.message.edit_text("📤 Please send the file to upload.", reply_markup=back_button(f"fm_{server_id}_{base64.b64encode(current_path.encode('utf-8')).decode()}"))
                 elif action == "download_selected":
-                    await download_selected(callback, server_id, user_input)
+                    await download_selected(callback, server_id, user_input, ssh)
                 elif action == "delete_selected":
-                    await delete_selected(callback, server_id, user_input)
-                await list_files(callback.message, server_id, current_path, bot, user_input)
+                    await delete_selected(callback, server_id, user_input, ssh)
+                await list_files(callback.message, server_id, current_path, bot, user_input, ssh)
         except Exception as e:
             logger.error(f"File action error: {str(e)}")
             await callback.message.edit_text(f"❌ Error: {str(e)}")
@@ -103,9 +116,19 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
         server_id = user_input[uid]["server_id"]
         current_path = user_input[uid]["path"]
         try:
-            ssh = active_sessions.get(server_id)
-            if not ssh:
-                raise ValueError("No active SSH session")
+            server = await get_server_by_id(server_id)
+            logger.debug(f"Upload server lookup for server_id={server_id}: {server}")
+            if not server:
+                logger.error(f"Server not found for server_id={server_id}")
+                await message.answer(f"❌ Server not found (ID: {server_id}).")
+                return
+            try:
+                ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+                logger.debug(f"SSH session initialized for upload, server_id={server_id}, ip={server['ip']}")
+            except Exception as e:
+                logger.error(f"SSH session error for server {server_id} ({server['ip']}): {str(e)}")
+                await message.answer(f"❌ Failed to connect to {server['name']} ({server['ip']}): {str(e)}")
+                return
             file = await bot.download_file_by_id(message.document.file_id)
             file_name = message.document.file_name
             file_path = os.path.join(current_path, file_name)
@@ -129,14 +152,10 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
             await message.answer(f"❌ Error uploading file: {str(e)}")
         finally:
             user_input.pop(uid, None)
-            await list_files(message, server_id, current_path, bot, user_input)
+            await list_files(message, server_id, current_path, bot, user_input, ssh)
 
-async def list_files(message: types.Message, server_id: str, path: str, bot, user_input):
+async def list_files(message: types.Message, server_id: str, path: str, bot, user_input, ssh):
     try:
-        ssh = active_sessions.get(server_id)
-        if not ssh:
-            await message.edit_text("❌ No active SSH session.")
-            return
         stdin, stdout, stderr = ssh.exec_command(f'ls -1 "{path}"')
         raw_output = stdout.read()
         raw_stderr = stderr.read()
@@ -179,12 +198,8 @@ async def list_files(message: types.Message, server_id: str, path: str, bot, use
         logger.error(f"List files error: {e}")
         await message.edit_text(f"❌ Error listing files: {str(e)}")
 
-async def show_file_options(callback: types.CallbackQuery, server_id: str, file_path: str, user_input):
+async def show_file_options(callback: types.CallbackQuery, server_id: str, file_path: str, user_input, ssh):
     try:
-        ssh = active_sessions.get(server_id)
-        if not ssh:
-            await callback.message.edit_text("❌ No active SSH session.")
-            return
         sftp = ssh.open_sftp()
         is_dir = sftp.lstat(file_path).st_mode & 0o40000
         sftp.close()
@@ -202,7 +217,7 @@ async def show_file_options(callback: types.CallbackQuery, server_id: str, file_
         logger.error(f"Show file options error: {e}")
         await callback.message.edit_text(f"❌ Error: {str(e)}")
 
-async def toggle_select_mode(callback: types.CallbackQuery, server_id: str, current_path: str, user_input):
+async def toggle_select_mode(callback: types.CallbackQuery, server_id: str, current_path: str, user_input, ssh):
     uid = callback.from_user.id
     if uid not in user_input:
         user_input[uid] = {}
@@ -213,17 +228,13 @@ async def toggle_select_mode(callback: types.CallbackQuery, server_id: str, curr
     else:
         user_input[uid]["selected_items"] = []
         await callback.message.edit_text("❌ Selection mode disabled.")
-    await list_files(callback.message, server_id, current_path, bot, user_input)
+    await list_files(callback.message, server_id, current_path, bot, user_input, ssh)
 
-async def download_selected(callback: types.CallbackQuery, server_id: str, user_input):
+async def download_selected(callback: types.CallbackQuery, server_id: str, user_input, ssh):
     uid = callback.from_user.id
     selected_items = user_input.get(uid, {}).get("selected_items", [])
     if not selected_items:
         await callback.message.edit_text("❌ No items selected.")
-        return
-    ssh = active_sessions.get(server_id)
-    if not ssh:
-        await callback.message.edit_text("❌ No active SSH session.")
         return
     for file_path in selected_items[:10]:
         try:
@@ -246,15 +257,11 @@ async def download_selected(callback: types.CallbackQuery, server_id: str, user_
     user_input[uid]["select_mode"] = False
     await callback.message.edit_text("✅ Download complete.")
 
-async def delete_selected(callback: types.CallbackQuery, server_id: str, user_input):
+async def delete_selected(callback: types.CallbackQuery, server_id: str, user_input, ssh):
     uid = callback.from_user.id
     selected_items = user_input.get(uid, {}).get("selected_items", [])
     if not selected_items:
         await callback.message.edit_text("❌ No items selected.")
-        return
-    ssh = active_sessions.get(server_id)
-    if not ssh:
-        await callback.message.edit_text("❌ No active SSH session.")
         return
     for file_path in selected_items:
         try:
@@ -267,20 +274,16 @@ async def delete_selected(callback: types.CallbackQuery, server_id: str, user_in
             sftp.close()
         except (paramiko.SFTPError, IOError) as e:
             logger.error(f"Delete selected error for {file_path}: {e}")
-            await callback.message.answer(f"❌ Failed to delete {os.path.basename(file_path)}: {str(e)}")
+            await message.answer(f"❌ Failed to delete {os.path.basename(file_path)}: {str(e)}")
     user_input[uid]["selected_items"] = []
     user_input[uid]["select_mode"] = False
     await callback.message.edit_text("✅ Selected items deleted.")
 
-async def zip_selected(callback: types.CallbackQuery, server_id: str, current_path: str, user_input):
+async def zip_selected(callback: types.CallbackQuery, server_id: str, current_path: str, user_input, ssh):
     uid = callback.from_user.id
     selected_items = user_input.get(uid, {}).get("selected_items", [])
     if not selected_items:
         await callback.message.edit_text("❌ No items selected.")
-        return
-    ssh = active_sessions.get(server_id)
-    if not ssh:
-        await callback.message.edit_text("❌ No active SSH session.")
         return
     try:
         stdin, stdout, stderr = ssh.exec_command("command -v zip")
@@ -307,13 +310,9 @@ async def zip_selected(callback: types.CallbackQuery, server_id: str, current_pa
     finally:
         user_input[uid]["selected_items"] = []
         user_input[uid]["select_mode"] = False
-        await list_files(callback.message, server_id, current_path, bot, user_input)
+        await list_files(callback.message, server_id, current_path, bot, user_input, ssh)
 
-async def unzip_file(callback: types.CallbackQuery, server_id: str, zip_path: str, current_path: str, user_input):
-    ssh = active_sessions.get(server_id)
-    if not ssh:
-        await callback.message.edit_text("❌ No active SSH session.")
-        return
+async def unzip_file(callback: types.CallbackQuery, server_id: str, zip_path: str, current_path: str, user_input, ssh):
     try:
         stdin, stdout, stderr = ssh.exec_command("command -v unzip")
         unzip_path = stdout.read().decode('utf-8', errors='replace').strip()
@@ -334,4 +333,4 @@ async def unzip_file(callback: types.CallbackQuery, server_id: str, zip_path: st
         logger.error(f"Unzip error: {e}")
         await callback.message.edit_text(f"❌ Failed to unzip: {str(e)}")
     finally:
-        await list_files(callback.message, server_id, current_path, bot, user_input)
+        await list_files(callback.message, server_id, current_path, bot, user_input, ssh)
