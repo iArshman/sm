@@ -5,6 +5,7 @@ import os
 from datetime import datetime
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
@@ -149,9 +150,8 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             InlineKeyboardButton("📋 Copy", callback_data=f"fm_copy_{server_id}_{file_name}"),
             InlineKeyboardButton("✂️ Move", callback_data=f"fm_move_{server_id}_{file_name}")
         )
-        kb.row(
+        kb.add(
             InlineKeyboardButton("ℹ️ Details", callback_data=f"fm_details_{server_id}_{file_name}"),
-            InlineKeyboardButton("🔒 Permissions", callback_data=f"fm_perms_{server_id}_{file_name}"),
             InlineKeyboardButton("⬅️ Back", callback_data=f"fm_refresh_{server_id}")
         )
         if is_zip:
@@ -387,7 +387,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                     file_data = remote_file.read()
                 await bot.send_document(
                     callback.from_user.id,
-                    document=types.InputFile(file_data, filename=file_name),
+                    document=types.InputFile(BytesIO(file_data), filename=file_name),
                     caption=f"File from {current_path}"
                 )
             finally:
@@ -790,7 +790,8 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             file_name = message.document.file_name
             file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
             await message.answer(f"📤 Uploading {file_name} to {current_path}...")
-            file_data = await message.document.download(destination=BytesIO())
+            file_data = BytesIO()
+            await message.document.download(destination=file_data)
             ssh = active_sessions[server_id]
             sftp = ssh.open_sftp()
             try:
@@ -1161,8 +1162,8 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             text = f"🔍 Searching in {user_state['current_path']}. Please send a file name or pattern (e.g., *.txt)."
             await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
         except Exception as e:
-            logger.error(f"Search start_error = f"Search files start error for server {server_id}: {e}"
-            await callback.message.edit_text("❌ Error starting search.", reply_markup=back_button(f"server_{start_error}"))
+            logger.error(f"Search files start error for server {server_id}: {e}")
+            await callback.message.edit_text("❌ Error starting search.", reply_markup=back_button(f"server_{server_id}"))
 
     # --- HANDLE SEARCH ---
     @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'search_files')
@@ -1179,16 +1180,16 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 await message.answer("❌ Invalid search pattern.")
                 return
             current_path = user_state.get('current_path', '/home/ubuntu')
-            command = f'find "'{current_path}" -maxdepth 1 -name "*'{search_pattern}'*" -exec ls -l --time-style=+"'%b %d %H:%M'" "{}" \;'
+            command = f'find "{current_path}" -maxdepth 1 -name "*{search_pattern}*" -exec ls -l --time-style=+"%b %d %H:%M" "{}" \;'
             ssh = active_sessions[server_id]
             stdout_data, stderr_data = execute_ssh_command(ssh, command)
             if stderr_data or not stdout_data:
-                await message.answer("❌ No files found matching '{search_pattern}' in {current_path}.", reply_markup=back_button(f"fm_refresh_{server_id}"))
+                await message.answer(f"❌ No files found matching '{search_pattern}' in {current_path}.", reply_markup=back_button(f"fm_refresh_{server_id}"))
                 return
             files = parse_ls_output(stdout_data)
             kb = InlineKeyboardMarkup(row_width=2)
             max_name_len = max((len(f['name']) for f in files), default=10)
-            for f in sorted(files, key=lambda x: (not x['is_dir'], x['name'].lower()))):
+            for f in sorted(files, key=lambda x: (not x['is_dir'], x['name'].lower())):
                 icon = "📁" if f['is_dir'] else "📄"
                 name = f['name'].ljust(max_name_len)
                 size = format_size(f['size'])
@@ -1204,66 +1205,6 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             await message.answer(f"❌ Error searching files: {str(e)}")
         finally:
             if user_state.get('mode') == 'search_files':
-                user_state['mode'] = 'file_manager'
-
-    # --- CHANGE PERMISSIONS START ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("fm_perms_"))
-    async def change_permissions_start(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            if server_id not in active_sessions:
-                await callback.message.edit_text("❌ No active SSH session.")
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                await callback.message.edit_text("❌ Invalid file manager state.")
-                return
-            user_state['mode'] = 'change_perms'
-            user_state['file_name'] = file_name
-            text = f"🔒 Changing permissions for '{file_name}' in {user_state['current_path']}. Please send permissions in octal format (e.g., 644)."
-            await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
-        except Exception as e:
-            logger.error(f"Permissions start error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error initiating permissions change.", reply_markup=back_button(f"server_{server_id}"))
-
-    # --- HANDLE CHANGE PERMISSIONS ---
-    @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'change_perms')
-    async def handle_perms(message: types.Message):
-        try:
-            uid = message.from_user.id
-            user_state = user_input.get(uid, {})
-            server_id = user_state.get('server_id')
-            if server_id not in active_sessions:
-                await message.answer("❌ No active SSH session.")
-                return
-            file_name = user_state.get('file_name')
-            perms = message.text.strip()
-            if not re.match(r'^\d{3,4}$', perms):
-                await message.answer("❌ Invalid permissions format. Use octal (e.g., 644).")
-                return
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            command = f'chmod {perms} "{file_path}"'
-            ssh = active_sessions[server_id]
-            _, stderr_data = execute_ssh_command(ssh, command)
-            if stderr_data:
-                await message.answer(f"❌ Error changing permissions: {stderr_data}")
-                return
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await message.answer(f"❌ Error: {error}")
-                return
-            kb = build_file_keyboard(server_id, current_path, files, uid)
-            text = f"🗂 File Manager: {current_path}\n✅ Permissions for '{file_name}' changed to {perms}."
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
-            user_state['mode'] = 'file_manager'
-        except Exception as e:
-            logger.error(f"Permissions error for server {server_id}: {e}")
-            await message.answer(f"❌ Error changing permissions: {str(e)}")
-        finally:
-            if user_state.get('mode') == 'change_perms':
                 user_state['mode'] = 'file_manager'
 
     # --- REFRESH FILE LIST ---
