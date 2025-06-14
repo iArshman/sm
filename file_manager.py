@@ -155,8 +155,8 @@ async def handle_file_operation(server_id, user_state, operation, files, dest_pa
                 if not new_name:
                     return None, "Zip name required"
                 zip_path = sanitize_path(f"{current_path.rstrip('/')}/{new_name}")
-                # Fix: Compute sanitized path separately to avoid f-string issues
-                quoted_files = ' '.join(f'"{sanitize_path(os.path.join(current_path.rstrip('/'), f))}"' for f in files)
+                # Fix: Compute sanitized path separately to avoid f-string nesting issues
+                quoted_files = ' '.join(f'"{sanitize_path(os.path.join(current_path.rstrip("/"), f))}"' for f in files)
                 commands.append(f'cd "{current_path}" && zip -r "{zip_path}" {quoted_files}')
             elif operation == 'unzip':
                 commands.append(f'unzip -o "{src_path}" -d "{current_path}"')
@@ -172,7 +172,6 @@ async def handle_file_operation(server_id, user_state, operation, files, dest_pa
     except Exception as e:
         logger.error(f"File operation '{operation}' error for server {server_id}: {e}")
         return None, str(e)
-
     
     # --- HELPER: BUILD FILE KEYBOARD ---
     def build_file_keyboard(server_id, path, files, user_id):
