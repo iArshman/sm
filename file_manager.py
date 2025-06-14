@@ -101,31 +101,61 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         selected_files = user_state.get('selected_files', set())
         for f in sorted(files, key=lambda x: (not x['is_dir'], x['name'].lower())):
             icon = "📁" if f['is_dir'] else "📄"
-            select_icon = "✅ " if f['name'] in selected_files else ""
             name = f['name'].ljust(max_name_len)
             size = format_size(f['size'])
-            label = f"{select_icon}{icon} {name} | {size} | {f['mtime']}"
+            label = f"{icon} {name} | {size} | {f['mtime']}"
             if user_state.get('mode') == 'select_files':
-                cb_data = f"fm_toggle_select_{server_id}_{f['name']}"
-            elif f['is_dir']:
-                cb_data = f"fm_nav_{server_id}_{f['name']}"
+                select_label = "✅" if f['name'] in selected_files else "☑️"
+                select_cb = f"fm_toggle_select_{server_id}_{f['name']}"
+                kb.row(
+                    InlineKeyboardButton(select_label, callback_data=select_cb),
+                    InlineKeyboardButton(label, callback_data=select_cb)
+                )
             else:
-                cb_data = f"fm_file_{server_id}_{f['name']}"
-            kb.add(InlineKeyboardButton(label, callback_data=cb_data))
-        # Bottom navigation button
+                cb_data = f"fm_nav_{server_id}_{f['name']}" if f['is_dir'] else f"fm_file_{server_id}_{f['name']}"
+                kb.add(InlineKeyboardButton(label, callback_data=cb_data))
+        # Bottom navigation and selection action
         if path != '/':
             kb.add(InlineKeyboardButton("⬆️ Parent Directory", callback_data=f"fm_nav_{server_id}_.."))
+        if selected_files and user_state.get('mode') == 'select_files':
+            kb.add(InlineKeyboardButton(f"Selected: {len(selected_files)} Action", callback_data=f"fm_selection_actions_{server_id}"))
         return kb
 
     # --- HELPER: BUILD SELECTION ACTIONS KEYBOARD ---
-    def build_selection_actions_keyboard(server_id):
+    def build_selection_actions_keyboard(server_id, selected_files):
         kb = InlineKeyboardMarkup(row_width=3)
         kb.row(
-            InlineKeyboardButton("🗑 Delete Selected", callback_data=f"fm_batch_delete_{server_id}"),
-            InlineKeyboardButton("📋 Copy Selected", callback_data=f"fm_batch_copy_{server_id}"),
-            InlineKeyboardButton("✂️ Move Selected", callback_data=f"fm_batch_move_{server_id}")
+            InlineKeyboardButton("📋 Copy", callback_data=f"fm_batch_copy_{server_id}"),
+            InlineKeyboardButton("✂️ Move", callback_data=f"fm_batch_move_{server_id}"),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"fm_batch_delete_{server_id}")
         )
-        kb.add(InlineKeyboardButton("❌ Cancel Selection", callback_data=f"fm_cancel_select_{server_id}"))
+        if len(selected_files) > 1:
+            kb.add(InlineKeyboardButton("🗜 Zip", callback_data=f"fm_zip_{server_id}"))
+        if len(selected_files) == 1:
+            kb.add(InlineKeyboardButton("✏️ Rename", callback_data=f"fm_rename_{server_id}_{list(selected_files)[0]}"))
+        kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"fm_cancel_select_{server_id}"))
+        return kb
+
+    # --- HELPER: BUILD FILE ACTIONS KEYBOARD ---
+    def build_file_actions_keyboard(server_id, file_name, is_zip=False):
+        kb = InlineKeyboardMarkup(row_width=3)
+        kb.row(
+            InlineKeyboardButton("📥 Download", callback_data=f"fm_download_{server_id}_{file_name}"),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"fm_delete_{server_id}_{file_name}"),
+            InlineKeyboardButton("✏️ Rename", callback_data=f"fm_rename_{server_id}_{file_name}")
+        )
+        kb.row(
+            InlineKeyboardButton("👁️ View", callback_data=f"fm_view_{server_id}_{file_name}"),
+            InlineKeyboardButton("📋 Copy", callback_data=f"fm_copy_{server_id}_{file_name}"),
+            InlineKeyboardButton("✂️ Move", callback_data=f"fm_move_{server_id}_{file_name}")
+        )
+        kb.row(
+            InlineKeyboardButton("ℹ️ Details", callback_data=f"fm_details_{server_id}_{file_name}"),
+            InlineKeyboardButton("🔒 Permissions", callback_data=f"fm_perms_{server_id}_{file_name}"),
+            InlineKeyboardButton("⬅️ Back", callback_data=f"fm_refresh_{server_id}")
+        )
+        if is_zip:
+            kb.insert(InlineKeyboardButton("📂 Unzip", callback_data=f"fm_unzip_{server_id}_{file_name}"))
         return kb
 
     # --- HELPER: BACK BUTTON ---
@@ -167,7 +197,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_nav_"))
     async def navigate_directory(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             dir_name = parts[3] if len(parts) > 3 else '..'
             if server_id not in active_sessions:
@@ -203,7 +233,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_toggle_select_"))
     async def toggle_file_selection(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
@@ -228,9 +258,6 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
             text = f"🗂 File Manager: {current_path}\n☑️ Selected: {len(selected_files)} item(s)"
             await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-            if selected_files:
-                kb = build_selection_actions_keyboard(server_id)
-                await callback.message.answer("Select actions for chosen files:", reply_markup=kb)
         except Exception as e:
             logger.error(f"Toggle selection error for server {server_id}: {e}")
             await callback.message.edit_text("❌ Error selecting file.", reply_markup=back_button(f"server_{server_id}"))
@@ -244,8 +271,10 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 await callback.message.edit_text("❌ No active SSH session.")
                 return
             user_state = user_input.get(callback.from_user.id, {})
+            if user_state.get('server_id') != server_id:
+                await callback.message.edit_text("❌ Invalid file manager state.")
+                return
             user_state['mode'] = 'select_files'
-            user_state['server_id'] = server_id
             user_state['selected_files'] = set()
             current_path = user_state['current_path']
             ssh = active_sessions[server_id]
@@ -254,11 +283,35 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
                 return
             kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}\n☑️ Selection Mode: Click files to select"
+            text = f"🗂 File Manager: {current_path}\n☑️ Selection Mode: Click ☑️ to select files"
             await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except Exception as e:
             logger.error(f"Enter selection mode error for server {server_id}: {e}")
             await callback.message.edit_text("❌ Error entering selection mode.", reply_markup=back_button(f"server_{server_id}"))
+
+    # --- SHOW SELECTION ACTIONS ---
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_selection_actions_"))
+    async def show_selection_actions(callback: types.CallbackQuery):
+        try:
+            server_id = callback.data.split('_')[3]
+            if server_id not in active_sessions:
+                await callback.message.edit_text("❌ No active SSH session.")
+                return
+            user_state = user_input.get(callback.from_user.id, {})
+            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
+                await callback.message.edit_text("❌ Invalid file manager state.")
+                return
+            selected_files = user_state.get('selected_files', set())
+            if not selected_files:
+                await callback.message.edit_text("❌ No files selected.", reply_markup=back_button(f"fm_refresh_{server_id}"))
+                return
+            current_path = user_state['current_path']
+            kb = build_selection_actions_keyboard(server_id, selected_files)
+            text = f"🗂 File Manager: {current_path}\n☑️ Selected: {len(selected_files)} item(s)\nChoose an action:"
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            logger.error(f"Show selection actions error for server {server_id}: {e}")
+            await callback.message.edit_text("❌ Error showing actions.", reply_markup=back_button(f"server_{server_id}"))
 
     # --- CANCEL SELECTION MODE ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_cancel_select_"))
@@ -269,6 +322,9 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 await callback.message.edit_text("❌ No active SSH session.")
                 return
             user_state = user_input.get(callback.from_user.id, {})
+            if user_state.get('server_id') != server_id:
+                await callback.message.edit_text("❌ Invalid file manager state.")
+                return
             user_state['mode'] = 'file_manager'
             user_state['selected_files'] = set()
             current_path = user_state.get('current_path', '/home/ubuntu')
@@ -288,7 +344,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_file_"))
     async def file_actions(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
@@ -299,23 +355,8 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 await callback.message.edit_text("❌ Invalid file manager state.")
                 return
             current_path = user_state['current_path']
-            file_path = f"{current_path.rstrip('/')}/{file_name}"
-            kb = InlineKeyboardMarkup(row_width=3)
-            kb.row(
-                InlineKeyboardButton("📥 Download", callback_data=f"fm_download_{server_id}_{file_name}"),
-                InlineKeyboardButton("🗑 Delete", callback_data=f"fm_delete_{server_id}_{file_name}"),
-                InlineKeyboardButton("✏️ Rename", callback_data=f"fm_rename_{server_id}_{file_name}")
-            )
-            kb.row(
-                InlineKeyboardButton("👁️ View", callback_data=f"fm_view_{server_id}_{file_name}"),
-                InlineKeyboardButton("📋 Copy", callback_data=f"fm_copy_{server_id}_{file_name}"),
-                InlineKeyboardButton("✂️ Move", callback_data=f"fm_move_{server_id}_{file_name}")
-            )
-            kb.row(
-                InlineKeyboardButton("ℹ️ Details", callback_data=f"fm_details_{server_id}_{file_name}"),
-                InlineKeyboardButton("🔒 Permissions", callback_data=f"fm_perms_{server_id}_{file_name}"),
-                InlineKeyboardButton("⬅️ Back", callback_data=f"fm_refresh_{server_id}")
-            )
+            is_zip = file_name.lower().endswith('.zip')
+            kb = build_file_actions_keyboard(server_id, file_name, is_zip)
             text = f"📄 File: {file_name}\nPath: {current_path}"
             await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
         except Exception as e:
@@ -326,7 +367,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_download_"))
     async def download_file(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
@@ -343,11 +384,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             try:
                 await callback.message.edit_text(f"📥 Downloading {file_name}...")
                 with sftp.file(file_path, 'rb') as remote_file:
-                    await bot.send_document(
-                        callback.from_user.id,
-                        document=types.InputFile(remote_file, filename=file_name),
-                        caption=f"File from {current_path}"
-                    )
+                    file_data = remote_file.read()
+                await bot.send_document(
+                    callback.from_user.id,
+                    document=types.InputFile(file_data, filename=file_name),
+                    caption=f"File from {current_path}"
+                )
             finally:
                 sftp.close()
             files, error = await get_file_list(server_id, current_path, ssh)
@@ -365,7 +407,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_delete_"))
     async def delete_file_confirm(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
@@ -392,7 +434,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_delete_confirm_"))
     async def delete_file(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 4)
+            parts = callback.data.split('_', maxsplit=4)
             server_id = parts[3]
             file_name = parts[4]
             if server_id not in active_sessions:
@@ -404,7 +446,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             current_path = user_state['current_path']
             file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            command = f'rm -f "{file_path}"'
+            command = f'rm -rf "{file_path}"'
             ssh = active_sessions[server_id]
             _, stderr_data = execute_ssh_command(ssh, command)
             if stderr_data:
@@ -467,7 +509,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             errors = []
             for file_name in selected_files:
                 file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-                command = f'rm -f "{file_path}"'
+                command = f'rm -rf "{file_path}"'
                 _, stderr_data = execute_ssh_command(ssh, command)
                 if stderr_data:
                     errors.append(f"{file_name}: {stderr_data}")
@@ -528,7 +570,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             errors = []
             for file_name in selected_files:
                 src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-                command = f'cp "{src_path}" "{dest_path}/{file_name}"'
+                command = f'cp -r "{src_path}" "{dest_path}/"'
                 _, stderr_data = execute_ssh_command(ssh, command)
                 if stderr_data:
                     errors.append(f"{file_name}: {stderr_data}")
@@ -592,7 +634,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             errors = []
             for file_name in selected_files:
                 src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-                command = f'mv "{src_path}" "{dest_path}/{file_name}"'
+                command = f'mv "{src_path}" "{dest_path}/"'
                 _, stderr_data = execute_ssh_command(ssh, command)
                 if stderr_data:
                     errors.append(f"{file_name}: {stderr_data}")
@@ -613,6 +655,103 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         finally:
             if user_state.get('mode') == 'batch_move':
                 user_state['mode'] = 'file_manager'
+
+    # --- ZIP SELECTED ---
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_zip_"))
+    async def zip_files_start(callback: types.CallbackQuery):
+        try:
+            server_id = callback.data.split('_')[2]
+            if server_id not in active_sessions:
+                await callback.message.edit_text("❌ No active SSH session.")
+                return
+            user_state = user_input.get(callback.from_user.id, {})
+            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
+                await callback.message.edit_text("❌ Invalid file manager state.")
+                return
+            if not user_state.get('selected_files', set()):
+                await callback.message.edit_text("❌ No files selected.", reply_markup=back_button(f"fm_refresh_{server_id}"))
+                return
+            user_state['mode'] = 'zip_files'
+            text = f"🗜 Please send the name for the zip file (e.g., archive.zip) to create in {user_state['current_path']}."
+            await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
+        except Exception as e:
+            logger.error(f"Zip files start error for server {server_id}: {e}")
+            await callback.message.edit_text("❌ Error initiating zip creation.", reply_markup=back_button(f"server_{server_id}"))
+
+    # --- HANDLE ZIP FILES ---
+    @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'zip_files')
+    async def handle_zip_files(message: types.Message):
+        try:
+            uid = message.from_user.id
+            user_state = user_input.get(uid, {})
+            server_id = user_state.get('server_id')
+            if server_id not in active_sessions:
+                await message.answer("❌ No active SSH session.")
+                return
+            zip_name = re.sub(r'[;&|`\n\r/]', '', message.text.strip())
+            if not zip_name.endswith('.zip'):
+                zip_name += '.zip'
+            if not zip_name:
+                await message.answer("❌ Invalid zip file name.")
+                return
+            current_path = user_state.get('current_path', '/home/ubuntu')
+            zip_path = sanitize_path(f"{current_path.rstrip('/')}/{zip_name}")
+            selected_files = user_state.get('selected_files', set())
+            ssh = active_sessions[server_id]
+            file_paths = [sanitize_path(f"{current_path.rstrip('/')}/{f}") for f in selected_files]
+            command = f'zip -r "{zip_path}" {" ".join(f"\"{p}\"" for p in file_paths)}'
+            _, stderr_data = execute_ssh_command(ssh, command)
+            if stderr_data:
+                await message.answer(f"❌ Error creating zip: {stderr_data}")
+                return
+            user_state['selected_files'] = set()
+            user_state['mode'] = 'file_manager'
+            files, error = await get_file_list(server_id, current_path, ssh)
+            if error:
+                await message.answer(f"❌ Error: {error}")
+                return
+            kb = build_file_keyboard(server_id, current_path, files, uid)
+            text = f"🗂 File Manager: {current_path}\n✅ Zip file '{zip_name}' created."
+            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            logger.error(f"Zip files error for server {server_id}: {e}")
+            await message.answer(f"❌ Error creating zip: {str(e)}")
+        finally:
+            if user_state.get('mode') == 'zip_files':
+                user_state['mode'] = 'file_manager'
+
+    # --- UNZIP FILE ---
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_unzip_"))
+    async def unzip_file(callback: types.CallbackQuery):
+        try:
+            parts = callback.data.split('_', maxsplit=3)
+            server_id = parts[2]
+            file_name = parts[3]
+            if server_id not in active_sessions:
+                await callback.message.edit_text("❌ No active SSH session.")
+                return
+            user_state = user_input.get(callback.from_user.id, {})
+            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
+                await callback.message.edit_text("❌ Invalid file manager state.")
+                return
+            current_path = user_state['current_path']
+            file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
+            ssh = active_sessions[server_id]
+            command = f'unzip -o "{file_path}" -d "{current_path}"'
+            _, stderr_data = execute_ssh_command(ssh, command)
+            if stderr_data:
+                await callback.message.edit_text(f"❌ Error unzipping file: {stderr_data}", reply_markup=back_button(f"fm_refresh_{server_id}"))
+                return
+            files, error = await get_file_list(server_id, current_path, ssh)
+            if error:
+                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
+                return
+            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
+            text = f"🗂 File Manager: {current_path}\n✅ File '{file_name}' unzipped."
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            logger.error(f"Unzip file error for server {server_id}: {e}")
+            await callback.message.edit_text(f"❌ Error unzipping file: {str(e)}", reply_markup=back_button(f"fm_refresh_{server_id}"))
 
     # --- UPLOAD FILE START ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_upload_"))
@@ -753,14 +892,14 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_rename_"))
     async def rename_file_start(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
                 await callback.message.edit_text("❌ No active SSH session.")
                 return
             user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
+            if user_state.get('server_id') != server_id or user_state.get('mode') not in ['file_manager', 'select_files']:
                 await callback.message.edit_text("❌ Invalid file manager state.")
                 return
             user_state['mode'] = 'rename_file'
@@ -814,7 +953,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_view_"))
     async def view_file_content(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
@@ -850,7 +989,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_details_"))
     async def file_details(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
@@ -885,7 +1024,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_copy_"))
     async def copy_file_start(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
@@ -920,7 +1059,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             current_path = user_state.get('current_path', '/home/ubuntu')
             src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            command = f'cp "{src_path}" "{dest_path}/{file_name}"'
+            command = f'cp -r "{src_path}" "{dest_path}/"'
             ssh = active_sessions[server_id]
             _, stderr_data = execute_ssh_command(ssh, command)
             if stderr_data:
@@ -945,7 +1084,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_move_"))
     async def move_file_start(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
@@ -980,7 +1119,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             current_path = user_state.get('current_path', '/home/ubuntu')
             src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            command = f'mv "{src_path}" "{dest_path}/{file_name}"'
+            command = f'mv "{src_path}" "{dest_path}/"'
             ssh = active_sessions[server_id]
             _, stderr_data = execute_ssh_command(ssh, command)
             if stderr_data:
@@ -1067,7 +1206,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_perms_"))
     async def change_permissions_start(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_', 3)
+            parts = callback.data.split('_', maxsplit=3)
             server_id = parts[2]
             file_name = parts[3]
             if server_id not in active_sessions:
