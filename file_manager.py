@@ -1180,7 +1180,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 await message.answer("❌ Invalid search pattern.")
                 return
             current_path = user_state.get('current_path', '/home/ubuntu')
-            command = f'find "{current_path}" -maxdepth 1 -name "*{search_pattern}*" -exec ls -l --time-style=+"%b %d %H:%M" "{}" \;'
+            command = f'find "{current_path}" -maxdepth 1 -name "*{search_pattern}*" -exec ls -l --time-style=+"%b %d %H:%M" "{{}}" \;'
             ssh = active_sessions[server_id]
             stdout_data, stderr_data = execute_ssh_command(ssh, command)
             if stderr_data or not stdout_data:
