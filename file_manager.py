@@ -1,7 +1,4 @@
-import logging
-import paramiko
-import re
-import os
+import logging, paramiko, re, os, html
 from datetime import datetime
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,1234 +6,637 @@ from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
-def init_file_manager(dp, bot, active_sessions, user_input):
-    # --- HELPER: EXECUTE SSH COMMAND ---
-    def execute_ssh_command(ssh, command):
+def init_file_manager(dp, bot, sessions, user_state):
+    def sanitize_path(path): return os.path.normpath(re.sub(r'[;&|`\n\r]', '', path)).replace('\\', '/').lstrip('/')
+    def format_size(b): return f"{b} B" if b < 1024 else f"{b/1024:.2f} KB" if b < 1024**2 else f"{b/(1024**2):.2f} MB" if b < 1024**3 else f"{b/(1024**3):.2f} GB"
+    
+    def exec_ssh(ssh, cmd):
         try:
-            stdin, stdout, stderr = ssh.exec_command(command)
-            stdout_data = stdout.read().decode('utf-8').strip()
-            stderr_data = stderr.read().decode('utf-8').strip()
-            if stderr_data:
-                logger.warning(f"SSH command '{command}' error: {stderr_data}")
-            return stdout_data, stderr_data
+            _, stdout, stderr = ssh.exec_command(cmd)
+            out, err = stdout.read().decode(), stderr.read().decode()
+            if err: logger.warning(f"SSH cmd '{cmd}' error: {err}")
+            return out.strip(), err.strip()
         except Exception as e:
-            logger.error(f"SSH command '{command}' failed: {e}")
+            logger.error(f"SSH cmd '{cmd}' failed: {e}")
             raise
 
-    # --- HELPER: SANITIZE PATH ---
-    def sanitize_path(path):
-        path = re.sub(r'[;&|`\n\r]', '', path)
-        path = os.path.normpath(path).replace('\\', '/')
-        if path.startswith('/'):
-            return path
-        return '/' + path
-
-    # --- HELPER: FORMAT FILE SIZE ---
-    def format_size(size_bytes):
-        if size_bytes < 1024:
-            return f"{size_bytes} B"
-        elif size_bytes < 1024 ** 2:
-            return f"{size_bytes / 1024:.2f} KB"
-        elif size_bytes < 1024 ** 3:
-            return f"{size_bytes / (1024 ** 2):.2f} MB"
-        else:
-            return f"{size_bytes / (1024 ** 3):.2f} GB"
-
-    # --- HELPER: PARSE LS OUTPUT ---
-    def parse_ls_output(output):
+    def parse_ls(out):
         files = []
-        for line in output.splitlines():
-            match = re.match(r'^([drwx-]+)\s+\d+\s+(\S+)\s+(\S+)\s+(\d+)\s+(\w+\s+\d+\s+\d+:\d+|\w+\s+\d+\s+\d+)\s+(.+)$', line)
-            if match:
-                perms, owner, group, size, mtime, name = match.groups()
-                is_dir = perms.startswith('d')
-                try:
-                    mtime_dt = datetime.strptime(mtime, '%b %d %H:%M')
-                    mtime_str = mtime_dt.replace(year=datetime.now().year).strftime('%Y-%m-%d %H:%M')
-                except ValueError:
-                    try:
-                        mtime_dt = datetime.strptime(mtime, '%b %d %Y')
-                        mtime_str = mtime_dt.strftime('%Y-%m-%d')
-                    except ValueError:
-                        mtime_str = mtime
-                files.append({
-                    'name': name.strip(),
-                    'is_dir': is_dir,
-                    'size': int(size),
-                    'mtime': mtime_str,
-                    'perms': perms,
-                    'owner': owner,
-                    'group': group
-                })
+        for line in out.splitlines():
+            m = re.match(r'^([drwx-]+)\s+\d+\s+(\S+)\s+(\S+)\s+(\d+)\s+(\w+\s+\d+\s+\d+:\d+|\w+\s+\d+\s+\d+)\s+(.+)$', line)
+            if m:
+                perms, owner, group, size, mtime, name = m.groups()
+                try: mt = datetime.strptime(mtime, '%b %d %H:%M').replace(year=datetime.now().year).strftime('%Y-%m-%d %H:%M')
+                except: mt = datetime.strptime(mtime, '%b %d %Y').strftime('%Y-%m-%d') if ' ' in mtime else mtime
+                files.append({'name': name.strip(), 'is_dir': perms.startswith('d'), 'size': int(size), 'mtime': mt, 'perms': perms, 'owner': owner, 'group': group})
         return files
 
-    # --- HELPER: GET FILE LIST ---
-    async def get_file_list(server_id, path, ssh):
+    async def get_files(sid, path, ssh):
         try:
-            path = sanitize_path(path)
-            command = f'ls -l --time-style=+"%b %d %H:%M" "{path}"'
-            stdout_data, stderr_data = execute_ssh_command(ssh, command)
-            if stderr_data and "No such file or directory" in stderr_data:
-                return None, f"Directory '{path}' not found"
-            files = parse_ls_output(stdout_data)
-            return files, None
+            out, err = exec_ssh(ssh, f'ls -l --time-style=+"%b %d %H:%M" "{sanitize_path(path)}"')
+            return None, f"Directory '{path}' not found" if "No such file" in err else (parse_ls(out), None)
         except Exception as e:
-            logger.error(f"Failed to list files in {path}: {e}")
             return None, str(e)
 
-    # --- HELPER: BUILD FILE MANAGER KEYBOARD ---
-    def build_file_keyboard(server_id, path, files, user_id):
+    def build_kb(sid, path, files, uid, sel_mode=False, sel_files=None):
         kb = InlineKeyboardMarkup(row_width=4)
-        # Top action buttons
-        kb.row(
-            InlineKeyboardButton("⬅️ Server", callback_data=f"server_{server_id}"),
-            InlineKeyboardButton("🔍 Search", callback_data=f"fm_search_{server_id}"),
-            InlineKeyboardButton("📤 Upload", callback_data=f"fm_upload_{server_id}"),
-            InlineKeyboardButton("📁 New Folder", callback_data=f"fm_new_folder_{server_id}")
-        )
-        kb.add(InlineKeyboardButton("☑️ Select Files", callback_data=f"fm_select_mode_{server_id}"))
-        # File/directory buttons
-        max_name_len = max((len(f['name']) for f in files), default=10)
-        user_state = user_input.get(user_id, {})
-        selected_files = user_state.get('selected_files', set())
+        kb.row(*[InlineKeyboardButton(t, callback_data=c) for t, c in [
+            ("⬅️ Server", f"server_{sid}"), ("🔍 Search", f"fm_search_{sid}"),
+            ("📤 Upload", f"fm_upload_{sid}"), ("📁 New Folder", f"fm_new_folder_{sid}")]])
+        kb.add(InlineKeyboardButton("☑️ Select Files", callback_data=f"fm_select_mode_{sid}"))
+        max_len = max((len(f['name']) for f in files), default=10)
         for f in sorted(files, key=lambda x: (not x['is_dir'], x['name'].lower())):
-            icon = "📁" if f['is_dir'] else "📄"
-            name = f['name'].ljust(max_name_len)
-            size = format_size(f['size'])
-            label = f"{icon} {name} | {size} | {f['mtime']}"
-            if user_state.get('mode') == 'select_files':
-                select_label = "✅" if f['name'] in selected_files else "☑️"
-                select_cb = f"fm_toggle_select_{server_id}_{f['name']}"
-                kb.row(
-                    InlineKeyboardButton(select_label, callback_data=select_cb),
-                    InlineKeyboardButton(label, callback_data=select_cb)
-                )
+            icon, name, size, mt = "📁" if f['is_dir'] else "📄", f['name'].ljust(max_len), format_size(f['size']), f['mtime']
+            label = f"{icon} {name} | {size} | {mt}"
+            if sel_mode:
+                sel = "✅" if f['name'] in sel_files else "☑️"
+                cb = f"fm_toggle_select_{sid}_{f['name']}"
+                kb.row(InlineKeyboardButton(sel, callback_data=cb), InlineKeyboardButton(label, callback_data=cb))
             else:
-                cb_data = f"fm_nav_{server_id}_{f['name']}" if f['is_dir'] else f"fm_file_{server_id}_{f['name']}"
-                kb.add(InlineKeyboardButton(label, callback_data=cb_data))
-        # Bottom navigation and selection action
-        if path != '/':
-            kb.add(InlineKeyboardButton("⬆️ Parent Directory", callback_data=f"fm_nav_{server_id}_.."))
-        if selected_files and user_state.get('mode') == 'select_files':
-            kb.add(InlineKeyboardButton(f"Selected: {len(selected_files)} Action", callback_data=f"fm_selection_actions_{server_id}"))
+                cb = f"fm_nav_{sid}_{f['name']}" if f['is_dir'] else f"fm_file_{sid}_{f['name']}"
+                kb.add(InlineKeyboardButton(label, callback_data=cb))
+        if path != '/': kb.add(InlineKeyboardButton("⬆️ Parent Directory", callback_data=f"fm_nav_{sid}_.."))
+        if sel_mode and sel_files: kb.add(InlineKeyboardButton(f"Selected: {len(sel_files)} Action", callback_data=f"fm_selection_actions_{sid}"))
         return kb
 
-    # --- HELPER: BUILD SELECTION ACTIONS KEYBOARD ---
-    def build_selection_actions_keyboard(server_id, selected_files):
+    def build_sel_actions(sid, sel_count):
         kb = InlineKeyboardMarkup(row_width=3)
-        kb.row(
-            InlineKeyboardButton("📋 Copy", callback_data=f"fm_batch_copy_{server_id}"),
-            InlineKeyboardButton("✂️ Move", callback_data=f"fm_batch_move_{server_id}"),
-            InlineKeyboardButton("🗑 Delete", callback_data=f"fm_batch_delete_{server_id}")
-        )
-        if len(selected_files) > 1:
-            kb.add(InlineKeyboardButton("🗜 Zip", callback_data=f"fm_zip_{server_id}"))
-        if len(selected_files) == 1:
-            kb.add(InlineKeyboardButton("✏️ Rename", callback_data=f"fm_rename_{server_id}_{list(selected_files)[0]}"))
-        kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"fm_cancel_select_{server_id}"))
+        kb.row(*[InlineKeyboardButton(t, callback_data=c) for t, c in [
+            ("📋 Copy", f"fm_batch_copy_{sid}"), ("✂️ Move", f"fm_batch_move_{sid}"), ("🗑 Delete", f"fm_batch_delete_{sid}")]])
+        if sel_count > 1: kb.add(InlineKeyboardButton("🗜 Zip", callback_data=f"fm_zip_{sid}"))
+        if sel_count == 1: kb.add(InlineKeyboardButton("✏️ Rename", callback_data=f"fm_rename_{sid}_{list(user_state[uid]['selected_files'])[0].split('/')[-1]}"))
+        kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"fm_cancel_select_{sid}"))
         return kb
 
-    # --- HELPER: BUILD FILE ACTIONS KEYBOARD ---
-    def build_file_actions_keyboard(server_id, file_name, is_zip=False):
+    def build_file_actions(sid, fname, is_zip=False):
         kb = InlineKeyboardMarkup(row_width=3)
-        kb.row(
-            InlineKeyboardButton("📥 Download", callback_data=f"fm_download_{server_id}_{file_name}"),
-            InlineKeyboardButton("🗑 Delete", callback_data=f"fm_delete_{server_id}_{file_name}"),
-            InlineKeyboardButton("✏️ Rename", callback_data=f"fm_rename_{server_id}_{file_name}")
-        )
-        kb.row(
-            InlineKeyboardButton("👁️ View", callback_data=f"fm_view_{server_id}_{file_name}"),
-            InlineKeyboardButton("📋 Copy", callback_data=f"fm_copy_{server_id}_{file_name}"),
-            InlineKeyboardButton("✂️ Move", callback_data=f"fm_move_{server_id}_{file_name}")
-        )
-        kb.add(
-            InlineKeyboardButton("ℹ️ Details", callback_data=f"fm_details_{server_id}_{file_name}"),
-            InlineKeyboardButton("⬅️ Back", callback_data=f"fm_refresh_{server_id}")
-        )
-        if is_zip:
-            kb.insert(InlineKeyboardButton("📂 Unzip", callback_data=f"fm_unzip_{server_id}_{file_name}"))
+        kb.row(*[InlineKeyboardButton(t, callback_data=c) for t, c in [
+            ("📥 Download", f"fm_download_{sid}_{fname}"), ("🗑 Delete", f"fm_delete_{sid}_{fname}"), ("✏️ Rename", f"fm_rename_{sid}_{fname}")]])
+        kb.row(*[InlineKeyboardButton(t, callback_data=c) for t, c in [
+            ("👁️ View", f"fm_view_{sid}_{fname}"), ("📋 Copy", f"fm_copy_{sid}_{fname}"), ("✂️ Move", f"fm_move_{sid}_{fname}")]])
+        if is_zip: kb.insert(InlineKeyboardButton("📂 Unzip", callback_data=f"fm_unzip_{sid}_{fname}"))
+        kb.add(*[InlineKeyboardButton(t, callback_data=c) for t, c in [
+            ("ℹ️ Details", f"fm_details_{sid}_{fname}"), ("⬅️ Back", f"fm_refresh_{sid}")]])
         return kb
 
-    # --- HELPER: BACK BUTTON ---
-    def back_button(callback_data):
-        return InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=callback_data))
+    def back_btn(cb): return InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=cb))
+    def cancel_btn(): return InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Cancel", callback_data="fm_cancel"))
 
-    # --- HELPER: CANCEL BUTTON ---
-    def cancel_button():
-        return InlineKeyboardMarkup().add(InlineKeyboardButton("❌ Cancel", callback_data="fm_cancel"))
+    async def handle_error(callback, sid, msg, e=None):
+        if e: logger.error(f"Error for server {sid}: {e}")
+        await callback.message.edit_text(f"❌ {msg}", reply_markup=back_btn(f"server_{sid}"))
 
-    # --- FILE MANAGER ENTRY ---
+    async def refresh_fm(callback, sid, uid, path, ssh, msg="🗂 File Manager: {}"):
+        try:
+            files, err = await get_files(sid, path, ssh)
+            if err: return await handle_error(callback, sid, f"Error: {err}")
+            kb = build_kb(sid, path, files, uid, user_state[uid].get('mode') == 'select_files', {f.split('/')[-1] for f in user_state[uid].get('selected_files', set())})
+            await callback.message.edit_text(msg.format(path), parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            await handle_error(callback, sid, "Error refreshing file manager", e)
+
     @dp.callback_query_handler(lambda c: c.data.startswith("file_manager_"))
-    async def file_manager_start(callback: types.CallbackQuery):
+    async def fm_start(callback: types.CallbackQuery):
+        sid = callback.data.split('_')[2]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        user_state[callback.from_user.id] = {'server_id': sid, 'current_path': '/home/ubuntu', 'mode': 'file_manager', 'selected_files': set()}
+        ssh = sessions[sid]
         try:
-            server_id = callback.data.split('_')[2]
-            logger.debug(f"Starting file manager for server_id: {server_id}, active_sessions: {list(active_sessions.keys())}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_input[callback.from_user.id] = {
-                'server_id': server_id,
-                'current_path': '/home/ubuntu',
-                'mode': 'file_manager',
-                'selected_files': set()
-            }
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            path = user_input[callback.from_user.id]['current_path']
-            files, error = await get_file_list(server_id, path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {path}"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            await refresh_fm(callback, sid, callback.from_user.id, '/home/ubuntu', ssh)
         except Exception as e:
-            logger.error(f"File manager start error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error loading file manager.", reply_markup=back_button(f"server_{server_id}"))
+            del sessions[sid]
+            await handle_error(callback, sid, "SSH session expired. Please reconnect", e)
 
-    # --- NAVIGATE DIRECTORY ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_nav_"))
-    async def navigate_directory(callback: types.CallbackQuery):
+    async def nav_dir(callback: types.CallbackQuery):
+        sid, dir_name = callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid: return await handle_error(callback, sid, "Invalid file manager state")
+        path = us['current_path']
+        new_path = sanitize_path('/' if dir_name == '..' else f"{path.rstrip('/')}/{dir_name}")
+        us['current_path'], us['mode'], us['selected_files'] = new_path, 'file_manager', set()
+        ssh = sessions[sid]
         try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            dir_name = parts[3] if len(parts) > 3 else '..'
-            logger.debug(f"Navigating directory for server_id: {server_id}, dir: {dir_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id:
-                logger.warning(f"Server ID mismatch: user_state server_id={user_state.get('server_id')}, callback server_id={server_id}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            if dir_name == '..':
-                new_path = '/'.join(current_path.rstrip('/').split('/')[:-1]) or '/'
-            else:
-                new_path = f"{current_path.rstrip('/')}/{dir_name}"
-            new_path = sanitize_path(new_path)
-            user_state['current_path'] = new_path
-            if user_state.get('mode') == 'select_files':
-                user_state['selected_files'] = set()
-                user_state['mode'] = 'file_manager'
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            files, error = await get_file_list(server_id, new_path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, new_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {new_path}"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            await refresh_fm(callback, sid, callback.from_user.id, new_path, ssh)
         except Exception as e:
-            logger.error(f"Navigate directory error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error navigating directory.", reply_markup=back_button(f"server_{server_id}"))
+            del sessions[sid]
+            await handle_error(callback, sid, "SSH session expired. Please reconnect", e)
 
-    # --- TOGGLE FILE SELECTION ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_toggle_select_"))
-    async def toggle_file_selection(callback: types.CallbackQuery):
+    async def toggle_select(callback: types.CallbackQuery):
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
+        path, sel = us['current_path'], us.get('selected_files', set())
+        full_path = f"{path.rstrip('/')}/{fname}"
+        sel.remove(full_path) if full_path in sel else sel.add(full_path)
+        us['selected_files'] = sel
+        ssh = sessions[sid]
         try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            logger.debug(f"Toggling selection for server_id: {server_id}, file: {file_name}, active_sessions: {list(active_sessions.keys())}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            selected_files = user_state.get('selected_files', set())
-            if file_name in selected_files:
-                selected_files.remove(file_name)
-            else:
-                selected_files.add(file_name)
-            user_state['selected_files'] = selected_files
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                logger.error(f"Failed to list files: {error}")
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}\n☑️ Selected: {len(selected_files)} item(s)"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            await refresh_fm(callback, sid, callback.from_user.id, path, ssh, f"🗂 File Manager: {{}}\n☑️ Selected: {len(sel)} item(s)")
         except Exception as e:
-            logger.error(f"Toggle selection error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error selecting file.", reply_markup=back_button(f"server_{server_id}"))
+            del sessions[sid]
+            await handle_error(callback, sid, "SSH session expired. Please reconnect", e)
 
-    # --- ENTER SELECTION MODE ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_select_mode_"))
-    async def enter_selection_mode(callback: types.CallbackQuery):
+    async def sel_mode(callback: types.CallbackQuery):
+        sid = callback.data.split('_')[3]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid: return await handle_error(callback, sid, "Invalid file manager state")
+        us['mode'], us['selected_files'] = 'select_files', set()
+        ssh = sessions[sid]
         try:
-            server_id = callback.data.split('_')[3]
-            logger.debug(f"Entering selection mode for server_id: {server_id}, active_sessions: {list(active_sessions.keys())}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id:
-                logger.warning(f"Server ID mismatch: user_state server_id={user_state.get('server_id')}, callback server_id={server_id}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state['mode'] = 'select_files'
-            user_state['selected_files'] = set()
-            current_path = user_state['current_path']
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                logger.error(f"Failed to list files: {error}")
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}\n☑️ Selection Mode: Click ☑️ to select files"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            await refresh_fm(callback, sid, callback.from_user.id, us['current_path'], ssh, f"🗂 File Manager: {{}}\n☑️ Selection Mode: Click ☑️ to select files")
         except Exception as e:
-            logger.error(f"Enter selection mode error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error entering selection mode.", reply_markup=back_button(f"server_{server_id}"))
+            del sessions[sid]
+            await handle_error(callback, sid, "SSH session expired. Please reconnect", e)
 
-    # --- SHOW SELECTION ACTIONS ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_selection_actions_"))
-    async def show_selection_actions(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[3]
-            logger.debug(f"Showing selection actions for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            selected_files = user_state.get('selected_files', set())
-            if not selected_files:
-                await callback.message.edit_text("❌ No files selected.", reply_markup=back_button(f"fm_refresh_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            kb = build_selection_actions_keyboard(server_id, selected_files)
-            text = f"🗂 File Manager: {current_path}\n☑️ Selected: {len(selected_files)} item(s)\nChoose an action:"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        except Exception as e:
-            logger.error(f"Show selection actions error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error showing actions.", reply_markup=back_button(f"server_{server_id}"))
+    async def sel_actions(callback: types.CallbackQuery):
+        sid = callback.data.split('_')[3]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
+        sel = us.get('selected_files', set())
+        if not sel: return await callback.message.edit_text("❌ No files selected", reply_markup=back_btn(f"fm_refresh_{sid}"))
+        kb = build_sel_actions(sid, len(sel))
+        await callback.message.edit_text(f"🗂 File Manager: {us['current_path']}\n☑️ Selected: {len(sel)} item(s)\nChoose an action:", parse_mode="HTML", reply_markup=kb)
 
-    # --- CANCEL SELECTION MODE ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_cancel_select_"))
-    async def cancel_selection_mode(callback: types.CallbackQuery):
+    async def cancel_sel(callback: types.CallbackQuery):
+        sid = callback.data.split('_')[3]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid: return await handle_error(callback, sid, "Invalid file manager state")
+        us['mode'], us['selected_files'] = 'file_manager', set()
+        ssh = sessions[sid]
         try:
-            server_id = callback.data.split('_')[3]
-            logger.debug(f"Canceling selection mode for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id:
-                logger.warning(f"Server ID mismatch: user_state server_id={user_state.get('server_id')}, callback server_id={server_id}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state['mode'] = 'file_manager'
-            user_state['selected_files'] = set()
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            await refresh_fm(callback, sid, callback.from_user.id, us['current_path'], ssh)
         except Exception as e:
-            logger.error(f"Cancel selection mode error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error cancelling selection.", reply_markup=back_button(f"server_{server_id}"))
+            del sessions[sid]
+            await handle_error(callback, sid, "SSH session expired. Please reconnect", e)
 
-    # --- FILE ACTIONS ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_file_"))
     async def file_actions(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            logger.debug(f"Showing file actions for server_id: {server_id}, file: {file_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            is_zip = file_name.lower().endswith('.zip')
-            kb = build_file_actions_keyboard(server_id, file_name, is_zip)
-            text = f"📄 File: {file_name}\nPath: {current_path}"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        except Exception as e:
-            logger.error(f"File actions error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error loading file actions.", reply_markup=back_button(f"server_{server_id}"))
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid file manager state")
+        kb = build_file_actions(sid, fname, fname.lower().endswith('.zip'))
+        await callback.message.edit_text(f"📄 File: {fname}\nPath: {us['current_path']}", parse_mode="HTML", reply_markup=kb)
 
-    # --- DOWNLOAD FILE ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_download_"))
-    async def download_file(callback: types.CallbackQuery):
+    async def download(callback: types.CallbackQuery):
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid file manager state")
+        path, ssh = us['current_path'], sessions[sid]
         try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            logger.debug(f"Downloading file for server_id: {server_id}, file: {file_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            ssh = active_sessions[server_id]
+            ssh.exec_command('whoami')
+            await callback.message.edit_text(f"📥 Downloading {fname}...")
             sftp = ssh.open_sftp()
             try:
-                await callback.message.edit_text(f"📥 Downloading {file_name}...")
-                with sftp.file(file_path, 'rb') as remote_file:
-                    file_data = remote_file.read()
-                await bot.send_document(
-                    callback.from_user.id,
-                    document=types.InputFile(BytesIO(file_data), filename=file_name),
-                    caption=f"File from {current_path}"
-                )
+                with sftp.file(f"{path.rstrip('/')}/{fname}", 'rb') as f:
+                    data = f.read()
+                await bot.send_document(callback.from_user.id, document=types.InputFile(BytesIO(data), filename=fname), caption=f"File from {path}")
             finally:
                 sftp.close()
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            await refresh_fm(callback, sid, callback.from_user.id, path, ssh)
         except Exception as e:
-            logger.error(f"Download file error for server {server_id}: {e}")
-            await callback.message.edit_text(f"❌ Error downloading file: {str(e)}", reply_markup=back_button(f"fm_refresh_{server_id}"))
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await handle_error(callback, sid, f"Error downloading file: {e}")
 
-    # --- DELETE FILE CONFIRM ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_delete_"))
-    async def delete_file_confirm(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            logger.debug(f"Confirming delete for server_id: {server_id}, file: {file_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                InlineKeyboardButton("✅ Yes, delete", callback_data=f"fm_delete_confirm_{server_id}_{file_name}"),
-                InlineKeyboardButton("⬅️ Back", callback_data=f"fm_refresh_{server_id}")
-            )
-            text = f"⚠️ Are you sure you want to delete '{file_name}' from {current_path}?"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        except Exception as e:
-            logger.error(f"Delete file confirm error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error initiating file deletion.", reply_markup=back_button(f"server_{server_id}"))
+    async def delete_confirm(callback: types.CallbackQuery):
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid file manager state")
+        kb = InlineKeyboardMarkup(row_width=2).add(
+            InlineKeyboardButton("✅ Yes, delete", callback_data=f"fm_delete_confirm_{sid}_{fname}"),
+            InlineKeyboardButton("⬅️ Back", callback_data=f"fm_refresh_{sid}"))
+        await callback.message.edit_text(f"⚠️ Delete '{fname}' from {us['current_path']}?", parse_mode="HTML", reply_markup=kb)
 
-    # --- DELETE FILE ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_delete_confirm_"))
-    async def delete_file(callback: types.CallbackQuery):
+    async def delete(callback: types.CallbackQuery):
+        sid, fname = callback.data.split('_', maxsplit=4)[3:5]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid state")
+        path, ssh = us['current_path'], sessions[sid]
         try:
-            parts = callback.data.split('_', maxsplit=4)
-            server_id = parts[3]
-            file_name = parts[4]
-            logger.debug(f"Deleting file for server_id: {server_id}, file: {file_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            command = f'rm -rf "{file_path}"'
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            _, stderr_data = execute_ssh_command(ssh, command)
-            if stderr_data:
-                await callback.message.edit_text(f"❌ Error deleting file: {stderr_data}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}\n✅ File '{file_name}' deleted."
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            _, err = exec_ssh(ssh, f'rm -rf "{path.rstrip('/')}/{fname}")
+            if err: return await callback.message.edit_text(f"❌ Error: {err}", reply=r_markup=back_btn(f"fm_refresh_{sid}"))
+            await refresh_fm(callback, sid, callback.from_user.id, path, ssh, f"🗂 File Manager: {{}}\n✅ '{fname}' deleted")
         except Exception as e:
-            logger.error(f"Delete file error for server {server_id}: {e}")
-            await callback.message.edit_text(f"❌ Error deleting file: {str(e)}", reply_markup=back_button(f"server_{server_id}"))
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await handle_error(callback, sid, f"Error deleting file: {e}")
 
-    # --- BATCH DELETE SELECTED ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_batch_delete_"))
     async def batch_delete_confirm(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[3]
-            logger.debug(f"Confirming batch delete for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            selected_files = user_state.get('selected_files', set())
-            if not selected_files:
-                await callback.message.edit_text("❌ No files selected.", reply_markup=back_button(f"fm_refresh_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                InlineKeyboardButton("✅ Yes, delete", callback_data=f"fm_batch_delete_confirm_{server_id}"),
-                InlineKeyboardButton("⬅️ Back", callback_data=f"fm_cancel_select_{server_id}")
-            )
-            text = f"⚠️ Are you sure you want to delete {len(selected_files)} selected file(s) from {current_path}?"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
-        except Exception as e:
-            logger.error(f"Batch delete confirm error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error initiating batch deletion.", reply_markup=back_button(f"server_{server_id}"))
+        sid = sid callback.data.split('_')[3]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = us user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
+        sel = sel us.get('selected_files', set())
+        if not sel: return await callback.message.edit_text("❌ No files selected", reply_markup="back_btn(f"fm_refresh_{sid}"))
+        kb = kb InlineKeyboardMarkup(row_width=2).add(
+            InlineKeyboardButton("✅ Yes, delete", callback_data="f"fm_batch_delete_confirm_{sid}"),
+            InlineKeyboardButton("⬅️ Back", callback_data="f"fm_cancel_select_{sid}"))
+        await callback.message.edit_text(f"⚠️ Delete {len(sel)} file(s) from {us['current_path']}?", parse_mode="HTML", reply_markup=kb, parse_mode="HTML")
 
-    # --- BATCH DELETE CONFIRM ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_batch_delete_confirm_"))
     async def batch_delete(callback: types.CallbackQuery):
+        sid = sid callback.data.split('_')[4]
+        if sid not in sessions: return await handle_error(callback, sid, f"No active SSH session")
+        us = us try user_state.get(callback.from_user.id, {})
+        if us.get('server_id'): != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid state")
+        path, sel, ssh = sel, us sel['current_path'], us.get('selected_files', set()), sessions[sid]
         try:
-            server_id = callback.data.split('_')[4]
-            logger.debug(f"Executing batch delete for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            selected_files = user_state.get('selected_files', set())
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            errors = []
-            for file_name in selected_files:
-                file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-                command = f'rm -rf "{file_path}"'
-                _, stderr_data = execute_ssh_command(ssh, command)
-                if stderr_data:
-                    errors.append(f"{file_name}: {stderr_data}")
-            user_state['selected_files'] = set()
-            user_state['mode'] = 'file_manager'
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}\n✅ {len(selected_files) - len(errors)} file(s) deleted."
-            if errors:
-                text += f"\nErrors:\n" + "\n".join(errors)
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami'):
+            errors = errors []
+            for for file_path in in sel:
+                file_name = fname os.path.basename(file_path)
+                _, err_data = exec_ssh(ssh, f"rm -rf \"{file_path}\"")
+                if err_data: errors.append(f"{file_name}: {err_data}")
+            us['selected_files'] = = set()
+            us['mode'] = = 'file_manager'
+            await refresh_fm(callback, sid, callback.from_user.id, path, ssh, f"🗂 File Manager: {{}}\n✅ {len(sel)-len(errors)} file(s) deleted" + (f"\nErrors:\n{'\n'.join(errors)}" if errors else ""))
         except Exception as e:
-            logger.error(f"Batch delete error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error deleting files: {str(e)}", reply_markup=back_button(f"server_{server_id}"))
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await handle_error(callback, sid, f"Error deleting files: {e}")
 
-    # --- BATCH COPY SELECTED ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_batch_copy_"))
     async def batch_copy_start(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[3]
-            logger.debug(f"Starting batch copy for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            if not user_state.get('selected_files', set()):
-                await callback.message.edit_text("❌ No files selected.", reply_markup=back_button(f"fm_refresh_{server_id}"))
-                return
-            user_state['mode'] = 'batch_copy'
-            text = f"📋 Please send the destination path for copying {len(user_state['selected_files'])} selected file(s) (e.g., /home/ubuntu/destination)."
-            await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
-        except Exception as e:
-            logger.error(f"Batch copy start error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error initiating batch copy.", reply_markup=back_button(f"server_{server_id}"))
+        sid = sid callback.data.split('_')[3]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = us user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
+        if not us.get('selected_files', set()): return await callback.message.edit_text("❌ No files selected", reply_markup="back_btn(f"fm_refresh_{sid}"))
+        us['mode'] = = 'batch_copy'
+        await bot.send_message(callback.from_user.id, f"📋 Send destination path for copying {len(us['selected_files'])} file(s) (e.g., /home/ubuntu/dest)", reply_markup=cancel_btn())
 
-    # --- HANDLE BATCH COPY ---
-    @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'batch_copy')
+    @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'batch_copy')
     async def handle_batch_copy(message: types.Message):
+        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = sid us.get('server_id')
+        if sid not in sessions: return await message.answer("❌ No active SSH session")
+        dest = dest sanitize_path(message.text.strip())
+        if not dest: return await message.answer("❌ Invalid destination path")
+        path, sel, ssh = sel us['current_path'], us.get('selected_files', set()), sessions[sid]
         try:
-            uid = message.from_user.id
-            user_state = user_input.get(uid, {})
-            server_id = user_state.get('server_id')
-            logger.debug(f"Handling batch copy for server_id: {server_id}, user: {uid}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await message.answer("❌ No active SSH session.")
-                return
-            dest_path = sanitize_path(message.text.strip())
-            if not dest_path:
-                await message.answer("❌ Invalid destination path.")
-                return
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            selected_files = user_state.get('selected_files', set())
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await message.answer("❌ SSH session expired. Please reconnect.")
-                return
-            errors = []
-            for file_name in selected_files:
-                src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-                command = f'cp -r "{src_path}" "{dest_path}/"'
-                _, stderr_data = execute_ssh_command(ssh, command)
-                if stderr_data:
-                    errors.append(f"{file_name}: {stderr_data}")
-            user_state['selected_files'] = set()
-            user_state['mode'] = 'file_manager'
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await message.answer(f"❌ Error: {error}")
-                return
-            kb = build_file_keyboard(server_id, current_path, files, uid)
-            text = f"🗂 File Manager: {current_path}\n✅ {len(selected_files) - len(errors)} file(s) copied to '{dest_path}'."
-            if errors:
-                text += f"\nErrors:\n" + "\n".join(errors)
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            errors = errors []
+            for for src in in sel:
+                fname = fname os.path.basename(src)
+                _, err = err exec_ssh(ssh, f"cp -r \"{src}\" \"{dest}/\"")
+                if err: errors.append(f"{fname}: {err}")
+            us['selected_files'], us['mode'] = = set(), 'file_manager'
+            await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ {len(sel)-len(errors)} file(s) copied to '{dest}'" + (f"\nErrors:\n{'\n'.join(errors)}" if errors else ""))
         except Exception as e:
-            logger.error(f"Batch copy error for server {server_id}: {e}")
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
             await message.answer(f"❌ Error copying files: {str(e)}")
         finally:
-            if user_state.get('mode') == 'batch_copy':
-                user_state['mode'] = 'file_manager'
+            if us.get('mode') == 'batch_copy': us['mode'] = 'file_manager'
 
-    # --- BATCH MOVE SELECTED ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_batch_move_"))
     async def batch_move_start(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[3]
-            logger.debug(f"Starting batch move for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            if not user_state.get('selected_files', set()):
-                await callback.message.edit_text("❌ No files selected.", reply_markup=back_button(f"fm_refresh_{server_id}"))
-                return
-            user_state['mode'] = 'batch_move'
-            text = f"✂️ Please send the destination path for moving {len(user_state['selected_files'])} selected file(s) (e.g., /home/ubuntu/destination)."
-            await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
-        except Exception as e:
-            logger.error(f"Batch move start error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error initiating batch move.", reply_markup=back_button(f"server_{server_id}"))
+        sid = sid callback.data.split('_')[3]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = us user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
+        if not us.get('selected_files', set()): return await callback.message.edit_text("❌ No files selected", reply_markup="back_btn(f"fm_refresh_{sid}"))
+        us['mode'] = = 'batch_move'
+        await bot.send_message(callback.from_user.id, f"✂️ Send destination path for moving {len(us['selected_files'])} file(s) (e.g., /home/ubuntu/dest)", reply_markup=cancel_btn())
 
-    # --- HANDLE BATCH MOVE ---
-    @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'batch_move')
+    @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'batch_move')
     async def handle_batch_move(message: types.Message):
+        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = sid us.get('server_id')
+        if sid not in sessions: return await message.answer("❌ No active SSH session")
+        dest = dest sanitize_path(message.text.strip())
+        if not dest: return await message.answer("❌ Invalid destination path")
+        path, sel, ssh = sel us['current_path'], us.get('selected_files', set()), sessions[sid]
         try:
-            uid = message.from_user.id
-            user_state = user_input.get(uid, {})
-            server_id = user_state.get('server_id')
-            logger.debug(f"Handling batch move for server_id: {server_id}, user: {uid}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await message.answer("❌ No active SSH session.")
-                return
-            dest_path = sanitize_path(message.text.strip())
-            if not dest_path:
-                await message.answer("❌ Invalid destination path.")
-                return
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            selected_files = user_state.get('selected_files', set())
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await message.answer("❌ SSH session expired. Please reconnect.")
-                return
-            errors = []
-            for file_name in selected_files:
-                src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-                command = f'mv "{src_path}" "{dest_path}/"'
-                _, stderr_data = execute_ssh_command(ssh, command)
-                if stderr_data:
-                    errors.append(f"{file_name}: {stderr_data}")
-            user_state['selected_files'] = set()
-            user_state['mode'] = 'file_manager'
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await message.answer(f"❌ Error: {error}")
-                return
-            kb = build_file_keyboard(server_id, current_path, files, uid)
-            text = f"🗂 File Manager: {current_path}\n✅ {len(selected_files) - len(errors)} file(s) moved to '{dest_path}'."
-            if errors:
-                text += f"\nErrors:\n" + "\n".join(errors)
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            errors = errors []
+            for for src in in sel:
+                fname = fname os.path.basename(src)
+                _, err = err exec_ssh(ssh, f"mv \"{src}\" \"{dest}/\"")
+                if err: errors.append(f"{fname}: {err}")
+            us['selected_files'], us['mode'] = = set(), 'file_manager'
+            await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ {len(sel)-len(errors)} file(s) moved to '{dest}'" + (f"\nErrors:\n{'\n'.join(errors)}" if errors else ""))
         except Exception as e:
-            logger.error(f"Batch move error for server {server_id}: {e}")
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
             await message.answer(f"❌ Error moving files: {str(e)}")
         finally:
-            if user_state.get('mode') == 'batch_move':
-                user_state['mode'] = 'file_manager'
+            if us.get('mode') == 'batch_move': us['mode'] = 'file_manager'
 
-    # --- ZIP ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_zip_"))
-    async def zip_files_start(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[2]
-            logger.debug(f"Starting zip for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            if not user_state.get('selected_files', set()):
-                await callback.message.edit_text("❌ No files selected.", reply_markup=back_button(f"fm_refresh_{server_id}"))
-                return
-            user_state['mode'] = 'zip_mode'
-            text = f"🗜 Creating zip file in {user_state['current_path']}. Please enter a name for the zip file (e.g., archive.zip)."
-            await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
-        except Exception as e:
-            logger.error(f"Zip start error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error initiating zip operation.", reply_markup=back_button(f"server_{server_id}"))
+    async def zip_start(callback: types.CallbackQuery):
+        sid = sid callback.data.split('_')[2]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = us user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
+        if not us.get('selected_files', set()): return await callback.message.edit_text("❌ No files selected", reply_markup="back_btn(f"fm_refresh_{sid}"))
+        us['mode'] = = 'zip_mode'
+        await bot.send_message(callback.from_user.id, f"🗜 Enter zip file name (e.g., archive.zip) for {us['current_path']}", reply_markup=cancel_btn())
 
-    # --- HANDLE ZIP ---
-    @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'zip_mode')
+    @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'zip_mode')
     async def handle_zip(message: types.Message):
+        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = sid us.get('server_id')
+        if sid not in sessions: return await message.answer("❌ No active SSH session")
+        zip_name = zip_name re.sub(r'[;&|`\n\r]', '', message.text.strip()) + ('.zip' if not message.text.endswith('.zip') else '')
+        if not zip_name: return await message.answer("❌ Invalid zip file name")
+        path, sel, ssh = sel us['current_path'], us.get('selected_files', set()), sessions[sid]
         try:
-            uid = message.from_user.id
-            user_state = user_input.get(uid, {})
-            server_id = user_state.get('server_id')
-            logger.debug(f"Handling zip for server_id: {server_id}, user: {uid}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await message.answer("❌ No active SSH session.")
-                return
-            zip_name = re.sub(r'[;&|`\n\r]', '', message.text.strip())
-            if not zip_name.endswith('.zip'):
-                zip_name += '.zip'
-            if not zip_name:
-                await message.answer("❌ Invalid zip file name.")
-                return
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            zip_path = sanitize_path(f"{current_path.rstrip('/')}/{zip_name}")
-            selected_files = user_state.get('selected_files', set())
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await message.answer("❌ SSH session expired. Please reconnect.")
-                return
-            file_paths = [sanitize_path(f"{current_path.rstrip('/')}/{f}") for f in selected_files]
-            quoted_files = ' '.join(f'"{p}"' for p in file_paths)
-            command = f'zip -r "{zip_path}" {quoted_files}'
-            _, stderr_data = execute_ssh_command(ssh, command)
-            if stderr_data:
-                await message.answer(f"❌ Error creating zip file: {stderr_data}")
-                return
-            user_state['selected_files'] = set()
-            user_state['mode'] = 'file_manager'
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await message.answer(f"❌ Error: {error}")
-                return
-            kb = build_file_keyboard(server_id, current_path, files, uid)
-            text = f"🗂 File Manager: {current_path}\n✅ Zip file '{zip_name}' created."
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            files = files ' '.join(f"\"{f}\"" for f in sel)
+            _, err = err exec_ssh(ssh, f"zip -r \"{path.rstrip('/')}/{zip_name}\" {files}")
+            if err: return await message.answer(f"❌ Error creating zip: {err}")
+            us['selected_files'], us['mode'] = = set(), 'file_manager'
+            await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ Zip file '{zip_name}' created")
         except Exception as e:
-            logger.error(f"Zip error for server {server_id}: {e}")
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
             await message.answer(f"❌ Error creating zip: {str(e)}")
         finally:
-            if user_state.get('mode') == 'zip_mode':
-                user_state['mode'] = 'file_manager'
+            if us.get('mode') == 'zip_mode': us['mode'] = 'file_manager'
 
-    # --- UNZIP ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_unzip_"))
-    async def unzip_file(callback: types.CallbackQuery):
+    async def unzip(callback: types.CallbackQuery):
+        sid, fname = fname callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = us user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid file manager state")
+        path, ssh = ssh us['current_path'], sessions[sid]
         try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            logger.debug(f"Unzipping file for server_id: {server_id}, file: {file_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            command = f'unzip -o "{file_path}" -d "{current_path}"'
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            _, stderr_data = execute_ssh_command(ssh, command)
-            if stderr_data:
-                await callback.message.edit_text(f"❌ Error unzipping file: {stderr_data}", reply_markup=back_button(f"fm_refresh_{server_id}"))
-                return
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}\n✅ File '{file_name}' unzipped."
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            _, err = err exec_ssh(ssh, f"unzip -o \"{path.rstrip('/')}/{fname}\" -d \"{path}\"")
+            if err: return await callback.message.edit_text(f"❌ Error unzipping: {err}", reply_markup="back_btn(f"fm_refresh_{sid}"))
+            await refresh_fm(callback, sid, callback.from_user.id, path, ssh, f"🗂 File Manager: {{}}\n✅ File '{fname}' unzipped")
         except Exception as e:
-            logger.error(f"Unzip error for server {server_id}: {e}")
-            await callback.message.edit_text(f"❌ Error unzipping file: {str(e)}", reply_markup=back_button(f"fm_refresh_{server_id}"))
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await handle_error(callback, sid, f"Error unzipping: {e}")
 
-    # --- UPLOAD FILE START ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_upload_"))
-    async def upload_file_start(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[2]
-            logger.debug(f"Starting upload for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id:
-                logger.warning(f"Server ID mismatch: user_state server_id={user_state.get('server_id')}, callback server_id={server_id}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state['mode'] = 'upload_file'
-            text = f"📤 Uploading to {user_state['current_path']}. Please send a file."
-            await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
-        except Exception as e:
-            logger.error(f"Upload start error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error initiating file upload.", reply_markup=back_button(f"server_{server_id}"))
+    async def upload_start(callback: types.CallbackQuery):
+        sid = sid callback.data.split('_')[2]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = us user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid: return await handle_error(callback, sid, "Invalid file manager state")
+        us['mode'] = = 'upload_file'
+        await bot.send_message(callback.from_user.id, f"📤 Send file to upload to {us['current_path']}", reply_markup=cancel_btn())
 
-    # --- HANDLE FILE UPLOAD ---
     @dp.message_handler(content_types=types.ContentType.DOCUMENT)
-    async def handle_file_upload(message: types.Message):
+    async def handle_upload(message: types.Message):
+        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
+        if us.get('mode') != 'upload_file': return await message.answer("❌ Not in upload mode")
+        sid = sid us.get('server_id')
+        if sid not in sessions: return await message.answer("❌ No active SSH session")
+        fname, path = path message.document.file_name, us['current_path']
         try:
-            uid = message.from_user.id
-            user_state = user_input.get(uid, {})
-            if user_state.get('mode') != 'upload_file':
-                await message.answer("❌ Not in upload mode.")
-                return
-            server_id = user_state.get('server_id')
-            logger.debug(f"Handling upload for server_id: {server_id}, user: {uid}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await message.answer("❌ No active SSH session.")
-                return
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            file_name = message.document.file_name
-            file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            await message.answer(f"📤 Uploading {file_name} to {current_path}...")
-            file_data = BytesIO()
-            await message.document.download(destination=file_data)
-            ssh = active_sessions[server_id]
+            ssh = ssh sessions[sid]
+            ssh.exec_command('whoami')
+            await message.answer(f"📤 Uploading {fname} to {path}")
+            data = dataio = BytesIO()
+            await message.document.download(data)
+            sftp = sftp.open_sftp()
             try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await message.answer("❌ SSH session expired. Please reconnect.")
-                return
-            sftp = ssh.open_sftp()
-            try:
-                with sftp.file(file_path, 'wb') as remote_file:
-                    remote_file.write(file_data.getvalue())
+                with sftp.file(f"{path.rstrip('/')}/{fname}", 'wb') as f:
+                    f.write(data.getvalue())
             finally:
                 sftp.close()
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await message.answer(f"❌ Error: {error}")
-                return
-            kb = build_file_keyboard(server_id, current_path, files, uid)
-            text = f"🗂 File Manager: {current_path}\n✅ File '{file_name}' uploaded."
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
-            user_state['mode'] = 'file_manager'
+            us['mode'] = = 'file_manager'
+            await refresh_fm(message.reply, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ File '{fname}' uploaded")
         except Exception as e:
-            logger.error(f"Upload error for server {server_id}: {e}")
-            await message.answer(f"❌ Error uploading file: {str(e)}")
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await message.answer(f"❌ Error uploading: {str(e)}")
         finally:
-            if user_state.get('mode') == 'upload_file':
-                user_state['mode'] = 'file_manager'
+            if us.get('mode') == 'upload_file': us['mode'] = 'file_manager'
 
-    # --- CANCEL UPLOAD ---
     @dp.callback_query_handler(lambda c: c.data == "fm_cancel")
-    async def cancel_upload(callback: types.CallbackQuery):
+    async def cancel(callback: types.CallbackQuery):
+        us = us user_state.get(callback.from_user.id, {})
+        sid = sid us.get('server_id')
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us['mode'], us['selected_files'] = = 'file_manager', set()
+        ssh = ssh sessions[sid]
         try:
-            user_state = user_input.get(callback.from_user.id, {})
-            server_id = user_state.get('server_id')
-            logger.debug(f"Canceling upload for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state['mode'] = 'file_manager'
-            user_state['selected_files'] = set()
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}\n✅ Operation cancelled."
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')
+            await refresh_fm(callback, sid, callback.from_user.id, us['current_path'], ssh, f"🗂 File Manager: {{}}\n✅ Operation cancelled")
         except Exception as e:
-            logger.error(f"Cancel upload error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error cancelling upload.", reply_markup=back_button(f"server_{server_id}"))
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await handle_error(callback, sid, f"Error cancelling: {e}")
 
-    # --- NEW FOLDER START ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_new_folder_"))
     async def new_folder_start(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[3]
-            logger.debug(f"Starting new folder for server_id: {server_id}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id:
-                logger.warning(f"Server ID mismatch: user_state server_id={user_state.get('server_id')}, callback server_id={server_id}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state['mode'] = 'new_folder'
-            text = f"📁 Creating new folder in {user_state['current_path']}. Please send a folder name."
-            await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
-        except Exception as e:
-            logger.error(f"New folder start error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error initiating new folder.", reply_markup=back_button(f"server_{server_id}"))
+        sid = sid callback.data.split('_')[3]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = us user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid: return await handle_error(callback, sid, "Invalid file manager state")
+        us['mode'] = = 'new_folder'
+        await bot.send_message(callback.from_user.id, f"📁 Send folder name for {us['current_path']}", reply_markup=cancel_btn())
 
-    # --- HANDLE NEW FOLDER ---
-    @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'new_folder')
+    @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'new_folder')
     async def handle_new_folder(message: types.Message):
+        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = sid us.get('server_id')
+        if sid not in sessions: return await message.answer("❌ No active SSH session")
+        fname = fname re.sub(r'[;&|`\n\r]', '', message.text.strip())
+        if not fname: return await message.answer("❌ Invalid folder name")
+        path, ssh = ssh us['current_path'], sessions[sid]
         try:
-            uid = message.from_user.id
-            user_state = user_input.get(uid, {})
-            server_id = user_state.get('server_id')
-            logger.debug(f"Handling new folder for server_id: {server_id}, user: {uid}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await message.answer("❌ No active SSH session.")
-                return
-            folder_name = re.sub(r'[;&|`\n\r]', '', message.text.strip())
-            if not folder_name:
-                await message.answer("❌ Invalid folder name.")
-                return
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            folder_path = sanitize_path(f"{current_path.rstrip('/')}/{folder_name}")
-            command = f'mkdir "{folder_path}"'
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await message.answer("❌ SSH session expired. Please reconnect.")
-                return
-            _, stderr_data = execute_ssh_command(ssh, command)
-            if stderr_data:
-                await message.answer(f"❌ Error creating folder: {stderr_data}")
-                return
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await message.answer(f"❌ Error: {error}")
-                return
-            kb = build_file_keyboard(server_id, current_path, files, uid)
-            text = f"🗂 File Manager: {current_path}\n✅ Folder '{folder_name}' created."
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
-            user_state['mode'] = 'file_manager'
+            ssh.exec_command('whoami')
+            _, err = err exec_ssh(ssh, f"mkdir \"{path.rstrip('/')}/{fname}\"")
+            if err: return await message.answer(f"❌ Error creating folder: {err}")
+            us['mode'] = = 'file_manager'
+            await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ Folder '{fname}' created")
         except Exception as e:
-            logger.error(f"New folder error for server {server_id}: {e}")
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
             await message.answer(f"❌ Error creating folder: {str(e)}")
         finally:
-            if user_state.get('mode') == 'new_folder':
-                user_state['mode'] = 'file_manager'
+            if us.get('mode') == 'new_folder': us['mode'] = 'file_manager'
 
-    # --- RENAME FILE START ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_rename_"))
-    async def rename_file_start(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            logger.debug(f"Starting rename for server_id: {server_id}, file: {file_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') not in ['file_manager', 'select_files']:
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state['mode'] = 'rename_file'
-            user_state['old_name'] = file_name
-            text = f"✏️ Renaming '{file_name}' in {user_state['current_path']}. Please send a new name."
-            await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
-        except Exception as e:
-            logger.error(f"Rename start error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error initiating rename.", reply_markup=back_button(f"server_{server_id}"))
+    async def rename_start(callback: types.CallbackQuery):
+        sid, fname = fname callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = us user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') not in ['file_manager', 'select_files']: return await handle_error(callback, sid, "Invalid file manager state")
+        us['mode'], us['old_name'] = = 'rename_file', fname
+        await bot.send_message(callback.from_user.id, f"✏️ Send new name for '{fname}' in {us['current_path']}", reply_markup=cancel_btn())
 
-    # --- HANDLE RENAME FILE ---
-    @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'rename_file')
+    @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'rename_file')
     async def handle_rename(message: types.Message):
+        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = sid us.get('server_id')
+        if sid not in sessions: return await message.answer("❌ No active SSH session")
+        old, new = new us.get('old_name'), re.sub(r'[;&|`\n\r]', '', message.text.strip())
+        if not new: return await message.answer("❌ Invalid file name")
+        path, ssh = ssh us['current_path'], sessions[sid]
         try:
-            uid = message.from_user.id
-            user_state = user_input.get(uid, {})
-            server_id = user_state.get('server_id')
-            logger.debug(f"Handling rename for server_id: {server_id}, user: {uid}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await message.answer("❌ No active SSH session.")
-                return
-            old_name = user_state.get('old_name')
-            new_name = re.sub(r'[;&|`\n\r]', '', message.text.strip())
-            if not new_name:
-                await message.answer("❌ Invalid file name.")
-                return
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            old_path = sanitize_path(f"{current_path.rstrip('/')}/{old_name}")
-            new_path = sanitize_path(f"{current_path.rstrip('/')}/{new_name}")
-            command = f'mv "{old_path}" "{new_path}"'
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await message.answer("❌ SSH session expired. Please reconnect.")
-                return
-            _, stderr_data = execute_ssh_command(ssh, command)
-            if stderr_data:
-                await message.answer(f"❌ Error renaming file: {stderr_data}")
-                return
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await message.answer(f"❌ Error: {error}")
-                return
-            kb = build_file_keyboard(server_id, current_path, files, uid)
-            text = f"🗂 File Manager: {current_path}\n✅ File '{old_name}' renamed to '{new_name}'."
-            await message.answer(text, parse_mode="HTML", reply_markup=kb)
-            user_state['mode'] = 'file_manager'
+            ssh.exec_command('whoami')
+            _, err = err exec_ssh(ssh, f"mv \"{path.rstrip('/')}/{old}\" \"{path.rstrip('/')}/{new}\"")
+            if err: return await message.answer(f"❌ Error renaming: {err}")
+            us['mode'] = = 'file_manager'
+            await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ File '{old}' renamed to '{new}'")
         except Exception as e:
-            logger.error(f"Rename error for server {server_id}: {e}")
-            await message.answer(f"❌ Error renaming file: {str(e)}")
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await message.answer(f"❌ Error renaming: {str(e)}")
         finally:
-            if user_state.get('mode') == 'rename_file':
-                user_state['mode'] = 'file_manager'
+            if us.get('mode') == 'rename_file': us['mode'] = 'file_manager'
 
-    # --- VIEW FILE CONTENT ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_view_"))
     async def view_file(callback: types.CallbackQuery):
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid file manager state")
+        path, ssh = us['current_path'], sessions[sid]
         try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            logger.debug(f"Viewing file for server_id: {server_id}, file: {file_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            ssh = active_sessions[server_id]
+            ssh.exec_command('whoami')
             sftp = ssh.open_sftp()
             try:
-                command = f'file "{file_path}"'
-                stdout_data, stderr_data = execute_ssh_command(ssh, command)
-                if stderr_data or 'text' not in stdout_data.lower():
-                    await callback.message.edit_text("❌ Only text files can be viewed.", reply_markup=back_button(f"fm_refresh_{server_id}"))
-                    return
-                with sftp.file(file_path, 'r') as remote_file:
-                    content = remote_file.read(4000).decode('utf-8', errors='replace')
-                    # Escape HTML characters
-                    content = content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    if len(content.encode('utf-8')) >= 4000:
-                        content = content[:3900] + "... (truncated)"
-                text = f"📄 File: {file_name}\nPath: {current_path}\n\n<pre>{content}</pre>"
-                await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_button(f"fm_refresh_{server_id}"))
+                out, err = exec_ssh(ssh, f'file "{path.rstrip('/')}/{fname}"')
+                if err or 'text' not in out.lower(): return await callback.message.edit_text("❌ Only text files can be viewed", reply_markup=back_btn(f"fm_refresh_{sid}"))
+                with sftp.file(f"{path.rstrip('/')}/{fname}", 'r') as f:
+                    content = html.escape(f.read(4000).decode('utf-8', errors='replace'))[:3900] + ("..." if len(f.read()) >= 4000 else "")
+                await callback.message.edit_text(f"📌 File: {fname}\nPath: {path}\n\n<pre>{content}</pre>", parse_mode="HTML", reply_markup=back_btn(f"fm_refresh_{sid}"))
             finally:
                 sftp.close()
         except Exception as e:
-            logger.error(f"View file error for server {server_id}: {e}")
-            await callback.message.edit_text(f"❌ Error viewing file: {str(e)}", reply_markup=back_button(f"fm_refresh_{server_id}"))
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await handle_error(callback, sid, f"Error viewing file: {e}")
 
-    # --- FILE DETAILS ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_details_"))
-    async def file_details(callback: types.CallbackQuery):
+    async def details_file(callback: types.CallbackQuery):
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid file manager state")
+        path, ssh = us['current_path'], sessions[sid]
         try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            logger.debug(f"Fetching details for server_id: {server_id}, file: {file_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            current_path = user_state['current_path']
-            file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            ssh = active_sessions[server_id]
-            try:
-                ssh.exec_command('whoami')  # Test SSH connection
-            except Exception as e:
-                logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
-                del active_sessions[server_id]
-                await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            command = f'ls -l "{file_path}"'
-            stdout_data, stderr_data = execute_ssh_command(ssh, command)
-            if stderr_data:
-                await callback.message.edit_text(f"❌ Error: {stderr_data}", reply_markup=back_button(f"fm_refresh_{server_id}"))
-                return
-            file_info = parse_ls_output(stdout_data)[0]
-            text = f"📄 File Details: {file_name}\n"
-            text += f"Path: {current_path}\n"
-            text += f"Size: {format_size(file_info['size'])}\n"
-            text += f"Modified: {file_info['mtime']}\n"
-            text += f"Permissions: {file_info['perms']}\n"
-            text += f"Owner: {file_info['owner']}\n"
-            text += f"Group: {file_info['group']}"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_button(f"fm_refresh_{server_id}"))
+            ssh.exec_command('whoami')
+            out, err = exec_ssh(ssh, f'ls -l "{path.rstrip('/')}/{fname}"')
+            if err: return await callback.message.edit_text(f"❌ Error: {err}", reply=back_btn(f"fm_refresh_{sid}"))
+            info = parse_ls(out)[0]
+            text = f"📋 File Details: {fname}\nPath: {path}\nSize: {format_size(info['size'])}\nModified: {info['mtime']}\nPermissions: {info['perms']}\nOwner: {info['owner']}\nGroup: {info['group']}"
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_btn(f"fm_refresh_{sid}"))
         except Exception as e:
-            logger.error(f"File details error for server {server_id}: {e}")
-            await callback.message.edit_text(f"❌ Error fetching file details: {str(e)}", reply_markup=back_button(f"fm_refresh_{server_id}"))
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await handle_error(callback, sid, f"Error fetching details: {e}")
 
-    # --- COPY FILE START ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_copy_"))
-    async def copy_file_start(callback: types.CallbackQuery):
+    async def copy_start(callback: types.CallbackQuery):
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid file manager state")
+        us['mode'], us['file_name'] = 'copy_file', fname
+        await bot.send_message(callback.from_user.id, f"📋 Send destination path for copying '{fname}' from {us['current_path']}", reply_markup=cancel_btn())
+
+    @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'copy_file')
+    async def handle_copy(message: types.Message):
+        uid, us = message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = us.get('server_id')
+        if sid not in sessions: return await message.answer("❌ No active SSH session")
+        fname, dest = us.get('file_name'), sanitize_path(message.text.strip())
+        if not dest: return await message.answer("❌ Invalid destination path")
+        path, ssh = us['current_path'], sessions[sid]
         try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            logger.debug(f"Starting copy for server_id: {server_id}, file: {file_name}")
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server_id: {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
-                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
-                return
-            user_state['mode'] = 'copy_file'
-            user_state['file_name'] = file_name
-            text = f"📋 Copying '{file_name}' from {user_state['current_path']}. Please send a destination path (e.g., /home/ubuntu/destination)."
-            await bot.send_message(callback.from_user.id, text, reply_markup=cancel_button())
+            ssh.exec_command('whoami')
+            _, err = exec_ssh(ssh, f'cp -r "{path.rstrip('/')}/{fname}" "{dest}"')
+            if err: return await message.answer(f"❌ Error copying: {err}")
+            us['mode'] = 'file_manager'
+            await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ File '{fname}' copied to '{dest}'")
         except Exception as e:
-            logger.error(f"Copy start error for server {server_id}: {e}")
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await message.answer(f"❌ Error copying: {str(e)}")
+        finally:
+            if us.get('mode') == 'copy_file': us['mode'] = 'file_manager'
+
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_move_"))
+    async def move_start(callback: types.CallbackQuery):
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid file manager state")
+        us['mode'], us['file_name'] = 'move_file', fname
+        await bot.send_message(callback.from_user.id, f"✂️ Send destination path for moving '{fname}' from {us['current_path']}", reply_markup=cancel_btn())
+
+    @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'move_file')
+    async def handle_move(message: types.Message):
+        uid, us = message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = us.get('server_id')
+        if sid not in sessions: return await message.answer("❌ No active SSH session")
+        fname, dest = us.get('file_name'), sanitize_path(message.text.strip())
+        if not dest: return await message.answer("❌ Invalid destination path")
+        path, ssh = us['current_path'], sessions[sid]
+        try:
+            ssh.exec_command('whoami')
+            _, err = exec_ssh(ssh, f'mv "{path.rstrip('/')}/{fname}" "{dest}"')
+            if err: return await message.answer(f"❌ Error moving: {err}")
+            us['mode'] = 'file_manager'
+            await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ File '{fname}' moved to '{dest}'")
+        except Exception as e:
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await message.answer(f"❌ Error moving: {str(e)}")
+        finally:
+            if us.get('mode') == 'move_file': us['mode'] = 'file_manager'
+
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_refresh_"))
+    async def refresh(callback: types.CallbackQuery):
+        sid = callback.data.split('_')[2]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid: return await handle_error(callback, sid, "Invalid file manager state")
+        ssh = sessions[sid]
+        try:
+            ssh.exec_command('whoami')
+            await refresh_fm(callback, sid, callback.from_user.id, us['current_path'], ssh)
+        except Exception as e:
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await handle_error(callback, sid, "Error refreshing: {e}")
+
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_search_"))
+    async def search_start(callback: types.CallbackQuery):
+        sid = callback.data.split('_')[2]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid: return await handle_error(callback, sid, "Invalid file manager state")
+        us['mode'] = 'search_files'
+        await bot.send_message(callback.from_user.id, f"🔍 Enter search query for files in {us['current_path']}", reply_markup=cancel_btn())
+
+    @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'search_files')
+    async def handle_search(message: types.Message):
+        uid, us = message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = us.get('server_id')
+        if sid not in sessions: return await message.answer("❌ No active SSH session")
+        query = re.sub(r'[;&|`\n\r]', '', message.text.strip())
+        if not query: return await message.answer("❌ Invalid search query")
+        path, ssh = us['current_path'], sessions[sid]
+        try:
+            ssh.exec_command('whoami')
+            out, err = exec_ssh(ssh, f'find "{path}" -type f -name "*{query}*" 2>/dev/null')
+            if err: return await message.answer(f"❌ Error searching: {err}")
+            files = [{'name': f[len(path)+1:], 'is_dir': False, 'size': 0, 'mtime': 'Unknown', 'perms': '', 'owner': '', 'group': ''} for f in out.splitlines() if f]
+            us['mode'] = 'file_manager'
+            kb = build_kb(sid, path, files[:50], uid) if files else InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back", callback_data=f"fm_refresh_{sid}"))
+            text = f"🗂 File Manager: {path}\n🔍 Found {len(files)} file(s) for '{query}'" + (f" (showing first 50)" if len(files) > 50 else "")
+            await message.answer(text, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            del sessions[sid] if isinstance(e, paramiko.SSHException) else None
+            await message.answer(f"❌ Error searching: {str(e)}")
+        finally:
+            if us.get('mode') == 'search_files': us['mode'] = 'file_manager'
