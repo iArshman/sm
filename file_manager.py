@@ -1294,17 +1294,26 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Copy start error for server {server_id}, user {callback.from_user.id}: {e}")
             await callback.message.edit_text("❌ Error initiating copy.", reply_markup=back_button(f"server_{server_id}"))
 
-    # --- HANDLE COPY FILE ---
+# --- HANDLE COPY FILE ---
     @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'copy_file')
-    async def handle_copy(message: types.Message):
+    async def handle_copy_file(message: types.Message):
         try:
             uid = message.from_user.id
             user_state = user_input.get(uid, {})
             server_id = user_state.get('server_id')
-            if server_id not in active_sessions:
-                await message.answer("❌ No active SSH session.")
+            logger.info(f"Handling copy for server_id: {server_id}")
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await message.answer("❌ Server not found.")
                 return
-            file_name = user_state.get('file_name')
+            try:
+                ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+            except Exception as e:
+                logger.error(f"Failed to get SSH session for server {server_id}: {e}")
+                await message.answer(f"❌ Failed to connect: {html.escape(str(e))}")
+                return
+            file_name = user_state.get('copy_file_name')
             dest_path = sanitize_path(message.text.strip())
             if not dest_path:
                 await message.answer("❌ Invalid destination path.")
@@ -1312,7 +1321,6 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             current_path = user_state.get('current_path', '/home/ubuntu')
             src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
             command = f'cp -r "{src_path}" "{dest_path}/"'
-            ssh = active_sessions[server_id]
             _, stderr_data = execute_ssh_command(ssh, command)
             if stderr_data:
                 await message.answer(f"❌ Error copying file: {html.escape(stderr_data)}")
@@ -1337,15 +1345,18 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     async def move_file_start(callback: types.CallbackQuery):
         await callback.answer()
         try:
-            parts = callback.data.split('_', maxsplit=2)
-            server_id = parts[1]
-            file_name = parts[2]
-            if server_id not in active_sessions:
-                await callback.message.edit_text("❌ No active SSH session.")
+            parts = callback.data.split('_', 3)
+            server_id = parts[2]
+            file_name = parts[3]
+            logger.info(f"Starting move for server_id: {server_id}, file: {file_name}")
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button(f"server_{server_id}"))
                 return
             user_state = user_input.get(callback.from_user.id, {})
             if user_state.get('server_id') != server_id or user_state.get('mode') != 'file_manager':
-                await callback.message.edit_text("❌ Invalid file manager state.")
+                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"fm_refresh_{server_id}"))
                 return
             user_state['mode'] = 'move_file'
             user_state['file_name'] = file_name
@@ -1357,13 +1368,22 @@ def init_file_manager(dp, bot, active_sessions, user_input):
 
     # --- HANDLE MOVE FILE ---
     @dp.message_handler(lambda m: user_input.get(m.from_user.id, {}).get('mode') == 'move_file')
-    async def handle_move(message: types.Message):
+    async def handle_move_file(message: types.Message):
         try:
             uid = message.from_user.id
             user_state = user_input.get(uid, {})
             server_id = user_state.get('server_id')
-            if server_id not in active_sessions:
-                await message.answer("❌ No active SSH session.")
+            logger.info(f"Handling move for server_id: {server_id}")
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await message.answer("❌ Server not found.")
+                return
+            try:
+                ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+            except Exception as e:
+                logger.error(f"Failed to get SSH session for server {server_id}: {e}")
+                await message.answer(f"❌ Failed to connect: {html.escape(str(e))}")
                 return
             file_name = user_state.get('file_name')
             dest_path = sanitize_path(message.text.strip())
@@ -1373,7 +1393,6 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             current_path = user_state.get('current_path', '/home/ubuntu')
             src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
             command = f'mv "{src_path}" "{dest_path}/"'
-            ssh = active_sessions[server_id]
             _, stderr_data = execute_ssh_command(ssh, command)
             if stderr_data:
                 await message.answer(f"❌ Error moving file: {html.escape(stderr_data)}")
@@ -1399,12 +1418,15 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         await callback.answer()
         try:
             server_id = callback.data.split('_')[2]
-            if server_id not in active_sessions:
-                await callback.message.edit_text("❌ No active SSH session.")
+            logger.info(f"Starting search for server_id: {server_id}")
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button(f"server_{server_id}"))
                 return
             user_state = user_input.get(callback.from_user.id, {})
             if user_state.get('server_id') != server_id:
-                await callback.message.edit_text("❌ Invalid file manager state.")
+                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"fm_refresh_{server_id}"))
                 return
             user_state['mode'] = 'search_files'
             text = f"🔍 Searching in {html.escape(user_state['current_path'])}. Please send a file name or pattern (e.g., *.txt)."
@@ -1420,8 +1442,17 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             uid = message.from_user.id
             user_state = user_input.get(uid, {})
             server_id = user_state.get('server_id')
-            if server_id not in active_sessions:
-                await message.answer("❌ No active SSH session.")
+            logger.info(f"Handling search for server_id: {server_id}")
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await message.answer("❌ Server not found.")
+                return
+            try:
+                ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+            except Exception as e:
+                logger.error(f"Failed to get SSH session for server {server_id}: {e}")
+                await message.answer(f"❌ Failed to connect: {html.escape(str(e))}")
                 return
             search_pattern = re.sub(r'[;&|`\n\r$<>]', '', message.text.strip())
             if not search_pattern:
@@ -1429,7 +1460,6 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             current_path = user_state.get('current_path', '/home/ubuntu')
             command = f'find "{current_path}" -maxdepth 1 -name "*{search_pattern}*" -exec ls -l --time-style=+"%b %d %H:%M" "{{}}" \;'
-            ssh = active_sessions[server_id]
             stdout_data, stderr_data = execute_ssh_command(ssh, command)
             if stderr_data or not stdout_data:
                 await message.answer(f"❌ No files found matching '{html.escape(search_pattern)}' in {html.escape(current_path)}.", reply_markup=back_button(f"fm_refresh_{server_id}"))
@@ -1461,14 +1491,22 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         await callback.answer()
         try:
             server_id = callback.data.split('_')[2]
-            if server_id not in active_sessions:
-                await callback.message.edit_text("❌ No active SSH session.")
+            logger.info(f"Refreshing file list for server_id: {server_id}")
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button(f"server_{server_id}"))
+                return
+            try:
+                ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+            except Exception as e:
+                logger.error(f"Failed to get SSH session for server {server_id}: {e}")
+                await callback.message.edit_text(f"❌ Failed to connect: {html.escape(str(e))}", reply_markup=back_button(f"server_{server_id}"))
                 return
             user_state = user_input.get(callback.from_user.id, {})
             if user_state.get('server_id') != server_id or user_state.get('mode') not in ['file_manager', 'select_files']:
-                await callback.message.edit_text("❌ Invalid file manager state.")
+                await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"fm_refresh_{server_id}"))
                 return
-            ssh = active_sessions[server_id]
             await refresh_file_list(callback, server_id, user_state, ssh)
         except Exception as e:
             logger.error(f"Refresh file list error for server {server_id}, user {callback.from_user.id}: {e}")
