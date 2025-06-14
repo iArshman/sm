@@ -235,8 +235,8 @@ def init_file_manager(dp, bot, sessions, user_state):
         path, ssh = us['current_path'], sessions[sid]
         try:
             ssh.exec_command('whoami')
-            _, err = exec_ssh(ssh, f'rm -rf "{path.rstrip('/')}/{fname}")
-            if err: return await callback.message.edit_text(f"❌ Error: {err}", reply=r_markup=back_btn(f"fm_refresh_{sid}"))
+            _, err = exec_ssh(ssh, f'rm -rf "{path.rstrip('/')}/{fname}"')
+            if err: return await callback.message.edit_text(f"❌ Error: {err}", reply_markup=back_btn(f"fm_refresh_{sid}"))
             await refresh_fm(callback, sid, callback.from_user.id, path, ssh, f"🗂 File Manager: {{}}\n✅ '{fname}' deleted")
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
@@ -244,33 +244,32 @@ def init_file_manager(dp, bot, sessions, user_state):
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_batch_delete_"))
     async def batch_delete_confirm(callback: types.CallbackQuery):
-        sid = sid callback.data.split('_')[3]
+        sid = callback.data.split('_')[3]
         if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
-        us = us user_state.get(callback.from_user.id, {})
+        us = user_state.get(callback.from_user.id, {})
         if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
-        sel = sel us.get('selected_files', set())
-        if not sel: return await callback.message.edit_text("❌ No files selected", reply_markup="back_btn(f"fm_refresh_{sid}"))
-        kb = kb InlineKeyboardMarkup(row_width=2).add(
-            InlineKeyboardButton("✅ Yes, delete", callback_data="f"fm_batch_delete_confirm_{sid}"),
-            InlineKeyboardButton("⬅️ Back", callback_data="f"fm_cancel_select_{sid}"))
-        await callback.message.edit_text(f"⚠️ Delete {len(sel)} file(s) from {us['current_path']}?", parse_mode="HTML", reply_markup=kb, parse_mode="HTML")
+        sel = us.get('selected_files', set())
+        if not sel: return await callback.message.edit_text("❌ No files selected", reply_markup=back_btn(f"fm_refresh_{sid}"))
+        kb = InlineKeyboardMarkup(row_width=2).add(
+            InlineKeyboardButton("✅ Yes, delete", callback_data=f"fm_batch_delete_confirm_{sid}"),
+            InlineKeyboardButton("⬅️ Back", callback_data=f"fm_cancel_select_{sid}"))
+        await callback.message.edit_text(f"⚠️ Delete {len(sel)} file(s) from {us['current_path']}?", parse_mode="HTML", reply_markup=kb)
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_batch_delete_confirm_"))
     async def batch_delete(callback: types.CallbackQuery):
-        sid = sid callback.data.split('_')[4]
-        if sid not in sessions: return await handle_error(callback, sid, f"No active SSH session")
-        us = us try user_state.get(callback.from_user.id, {})
-        if us.get('server_id'): != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid state")
-        path, sel, ssh = sel, us sel['current_path'], us.get('selected_files', set()), sessions[sid]
+        sid = callback.data.split('_')[4]
+        if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
+        us = user_state.get(callback.from_user.id, {})
+        if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid state")
+        path, sel, ssh = us['current_path'], us.get('selected_files', set()), sessions[sid]
         try:
-            ssh.exec_command('whoami'):
-            errors = errors []
-            for for file_path in in sel:
-                file_name = fname os.path.basename(file_path)
-                _, err_data = exec_ssh(ssh, f"rm -rf \"{file_path}\"")
-                if err_data: errors.append(f"{file_name}: {err_data}")
-            us['selected_files'] = = set()
-            us['mode'] = = 'file_manager'
+            ssh.exec_command('whoami')
+            errors = []
+            for file_path in sel:
+                fname = os.path.basename(file_path)
+                _, err = exec_ssh(ssh, f'rm -rf "{file_path}"')
+                if err: errors.append(f"{fname}: {err}")
+            us['selected_files'], us['mode'] = set(), 'file_manager'
             await refresh_fm(callback, sid, callback.from_user.id, path, ssh, f"🗂 File Manager: {{}}\n✅ {len(sel)-len(errors)} file(s) deleted" + (f"\nErrors:\n{'\n'.join(errors)}" if errors else ""))
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
@@ -278,30 +277,30 @@ def init_file_manager(dp, bot, sessions, user_state):
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_batch_copy_"))
     async def batch_copy_start(callback: types.CallbackQuery):
-        sid = sid callback.data.split('_')[3]
+        sid = callback.data.split('_')[3]
         if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
-        us = us user_state.get(callback.from_user.id, {})
+        us = user_state.get(callback.from_user.id, {})
         if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
-        if not us.get('selected_files', set()): return await callback.message.edit_text("❌ No files selected", reply_markup="back_btn(f"fm_refresh_{sid}"))
-        us['mode'] = = 'batch_copy'
+        if not us.get('selected_files', set()): return await callback.message.edit_text("❌ No files selected", reply_markup=back_btn(f"fm_refresh_{sid}"))
+        us['mode'] = 'batch_copy'
         await bot.send_message(callback.from_user.id, f"📋 Send destination path for copying {len(us['selected_files'])} file(s) (e.g., /home/ubuntu/dest)", reply_markup=cancel_btn())
 
     @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'batch_copy')
     async def handle_batch_copy(message: types.Message):
-        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
-        sid = sid us.get('server_id')
+        uid, us = message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = us.get('server_id')
         if sid not in sessions: return await message.answer("❌ No active SSH session")
-        dest = dest sanitize_path(message.text.strip())
+        dest = sanitize_path(message.text.strip())
         if not dest: return await message.answer("❌ Invalid destination path")
-        path, sel, ssh = sel us['current_path'], us.get('selected_files', set()), sessions[sid]
+        path, sel, ssh = us['current_path'], us.get('selected_files', set()), sessions[sid]
         try:
             ssh.exec_command('whoami')
-            errors = errors []
-            for for src in in sel:
-                fname = fname os.path.basename(src)
-                _, err = err exec_ssh(ssh, f"cp -r \"{src}\" \"{dest}/\"")
+            errors = []
+            for src in sel:
+                fname = os.path.basename(src)
+                _, err = exec_ssh(ssh, f'cp -r "{src}" "{dest}/"')
                 if err: errors.append(f"{fname}: {err}")
-            us['selected_files'], us['mode'] = = set(), 'file_manager'
+            us['selected_files'], us['mode'] = set(), 'file_manager'
             await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ {len(sel)-len(errors)} file(s) copied to '{dest}'" + (f"\nErrors:\n{'\n'.join(errors)}" if errors else ""))
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
@@ -311,30 +310,30 @@ def init_file_manager(dp, bot, sessions, user_state):
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_batch_move_"))
     async def batch_move_start(callback: types.CallbackQuery):
-        sid = sid callback.data.split('_')[3]
+        sid = callback.data.split('_')[3]
         if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
-        us = us user_state.get(callback.from_user.id, {})
+        us = user_state.get(callback.from_user.id, {})
         if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
-        if not us.get('selected_files', set()): return await callback.message.edit_text("❌ No files selected", reply_markup="back_btn(f"fm_refresh_{sid}"))
-        us['mode'] = = 'batch_move'
+        if not us.get('selected_files', set()): return await callback.message.edit_text("❌ No files selected", reply_markup=back_btn(f"fm_refresh_{sid}"))
+        us['mode'] = 'batch_move'
         await bot.send_message(callback.from_user.id, f"✂️ Send destination path for moving {len(us['selected_files'])} file(s) (e.g., /home/ubuntu/dest)", reply_markup=cancel_btn())
 
     @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'batch_move')
     async def handle_batch_move(message: types.Message):
-        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
-        sid = sid us.get('server_id')
+        uid, us = message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = us.get('server_id')
         if sid not in sessions: return await message.answer("❌ No active SSH session")
-        dest = dest sanitize_path(message.text.strip())
+        dest = sanitize_path(message.text.strip())
         if not dest: return await message.answer("❌ Invalid destination path")
-        path, sel, ssh = sel us['current_path'], us.get('selected_files', set()), sessions[sid]
+        path, sel, ssh = us['current_path'], us.get('selected_files', set()), sessions[sid]
         try:
             ssh.exec_command('whoami')
-            errors = errors []
-            for for src in in sel:
-                fname = fname os.path.basename(src)
-                _, err = err exec_ssh(ssh, f"mv \"{src}\" \"{dest}/\"")
+            errors = []
+            for src in sel:
+                fname = os.path.basename(src)
+                _, err = exec_ssh(ssh, f'mv "{src}" "{dest}/"')
                 if err: errors.append(f"{fname}: {err}")
-            us['selected_files'], us['mode'] = = set(), 'file_manager'
+            us['selected_files'], us['mode'] = set(), 'file_manager'
             await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ {len(sel)-len(errors)} file(s) moved to '{dest}'" + (f"\nErrors:\n{'\n'.join(errors)}" if errors else ""))
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
@@ -344,28 +343,28 @@ def init_file_manager(dp, bot, sessions, user_state):
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_zip_"))
     async def zip_start(callback: types.CallbackQuery):
-        sid = sid callback.data.split('_')[2]
+        sid = callback.data.split('_')[2]
         if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
-        us = us user_state.get(callback.from_user.id, {})
+        us = user_state.get(callback.from_user.id, {})
         if us.get('server_id') != sid or us.get('mode') != 'select_files': return await handle_error(callback, sid, "Invalid file manager state")
-        if not us.get('selected_files', set()): return await callback.message.edit_text("❌ No files selected", reply_markup="back_btn(f"fm_refresh_{sid}"))
-        us['mode'] = = 'zip_mode'
+        if not us.get('selected_files', set()): return await callback.message.edit_text("❌ No files selected", reply_markup=back_btn(f"fm_refresh_{sid}"))
+        us['mode'] = 'zip_mode'
         await bot.send_message(callback.from_user.id, f"🗜 Enter zip file name (e.g., archive.zip) for {us['current_path']}", reply_markup=cancel_btn())
 
     @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'zip_mode')
     async def handle_zip(message: types.Message):
-        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
-        sid = sid us.get('server_id')
+        uid, us = message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = us.get('server_id')
         if sid not in sessions: return await message.answer("❌ No active SSH session")
-        zip_name = zip_name re.sub(r'[;&|`\n\r]', '', message.text.strip()) + ('.zip' if not message.text.endswith('.zip') else '')
+        zip_name = re.sub(r'[;&|`\n\r]', '', message.text.strip()) + ('.zip' if not message.text.endswith('.zip') else '')
         if not zip_name: return await message.answer("❌ Invalid zip file name")
-        path, sel, ssh = sel us['current_path'], us.get('selected_files', set()), sessions[sid]
+        path, sel, ssh = us['current_path'], us.get('selected_files', set()), sessions[sid]
         try:
             ssh.exec_command('whoami')
-            files = files ' '.join(f"\"{f}\"" for f in sel)
-            _, err = err exec_ssh(ssh, f"zip -r \"{path.rstrip('/')}/{zip_name}\" {files}")
+            files = ' '.join(f'"{f}"' for f in sel)
+            _, err = exec_ssh(ssh, f'zip -r "{path.rstrip('/')}/{zip_name}" {files}')
             if err: return await message.answer(f"❌ Error creating zip: {err}")
-            us['selected_files'], us['mode'] = = set(), 'file_manager'
+            us['selected_files'], us['mode'] = set(), 'file_manager'
             await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ Zip file '{zip_name}' created")
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
@@ -375,15 +374,15 @@ def init_file_manager(dp, bot, sessions, user_state):
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_unzip_"))
     async def unzip(callback: types.CallbackQuery):
-        sid, fname = fname callback.data.split('_', maxsplit=3)[2:4]
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
         if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
-        us = us user_state.get(callback.from_user.id, {})
+        us = user_state.get(callback.from_user.id, {})
         if us.get('server_id') != sid or us.get('mode') != 'file_manager': return await handle_error(callback, sid, "Invalid file manager state")
-        path, ssh = ssh us['current_path'], sessions[sid]
+        path, ssh = us['current_path'], sessions[sid]
         try:
             ssh.exec_command('whoami')
-            _, err = err exec_ssh(ssh, f"unzip -o \"{path.rstrip('/')}/{fname}\" -d \"{path}\"")
-            if err: return await callback.message.edit_text(f"❌ Error unzipping: {err}", reply_markup="back_btn(f"fm_refresh_{sid}"))
+            _, err = exec_ssh(ssh, f'unzip -o "{path.rstrip('/')}/{fname}" -d "{path}"')
+            if err: return await callback.message.edit_text(f"❌ Error unzipping: {err}", reply_markup=back_btn(f"fm_refresh_{sid}"))
             await refresh_fm(callback, sid, callback.from_user.id, path, ssh, f"🗂 File Manager: {{}}\n✅ File '{fname}' unzipped")
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
@@ -391,34 +390,34 @@ def init_file_manager(dp, bot, sessions, user_state):
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_upload_"))
     async def upload_start(callback: types.CallbackQuery):
-        sid = sid callback.data.split('_')[2]
+        sid = callback.data.split('_')[2]
         if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
-        us = us user_state.get(callback.from_user.id, {})
+        us = user_state.get(callback.from_user.id, {})
         if us.get('server_id') != sid: return await handle_error(callback, sid, "Invalid file manager state")
-        us['mode'] = = 'upload_file'
+        us['mode'] = 'upload_file'
         await bot.send_message(callback.from_user.id, f"📤 Send file to upload to {us['current_path']}", reply_markup=cancel_btn())
 
     @dp.message_handler(content_types=types.ContentType.DOCUMENT)
     async def handle_upload(message: types.Message):
-        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
+        uid, us = message.from_user.id, user_state.get(message.from_user.id, {})
         if us.get('mode') != 'upload_file': return await message.answer("❌ Not in upload mode")
-        sid = sid us.get('server_id')
+        sid = us.get('server_id')
         if sid not in sessions: return await message.answer("❌ No active SSH session")
-        fname, path = path message.document.file_name, us['current_path']
+        fname, path = message.document.file_name, us['current_path']
         try:
-            ssh = ssh sessions[sid]
+            ssh = sessions[sid]
             ssh.exec_command('whoami')
             await message.answer(f"📤 Uploading {fname} to {path}")
-            data = dataio = BytesIO()
-            await message.document.download(data)
-            sftp = sftp.open_sftp()
+            data = BytesIO()
+            await message.document.download(destination=data)
+            sftp = ssh.open_sftp()
             try:
                 with sftp.file(f"{path.rstrip('/')}/{fname}", 'wb') as f:
                     f.write(data.getvalue())
             finally:
                 sftp.close()
-            us['mode'] = = 'file_manager'
-            await refresh_fm(message.reply, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ File '{fname}' uploaded")
+            us['mode'] = 'file_manager'
+            await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ File '{fname}' uploaded")
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
             await message.answer(f"❌ Error uploading: {str(e)}")
@@ -427,11 +426,11 @@ def init_file_manager(dp, bot, sessions, user_state):
 
     @dp.callback_query_handler(lambda c: c.data == "fm_cancel")
     async def cancel(callback: types.CallbackQuery):
-        us = us user_state.get(callback.from_user.id, {})
-        sid = sid us.get('server_id')
+        us = user_state.get(callback.from_user.id, {})
+        sid = us.get('server_id')
         if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
-        us['mode'], us['selected_files'] = = 'file_manager', set()
-        ssh = ssh sessions[sid]
+        us['mode'], us['selected_files'] = 'file_manager', set()
+        ssh = sessions[sid]
         try:
             ssh.exec_command('whoami')
             await refresh_fm(callback, sid, callback.from_user.id, us['current_path'], ssh, f"🗂 File Manager: {{}}\n✅ Operation cancelled")
@@ -441,26 +440,26 @@ def init_file_manager(dp, bot, sessions, user_state):
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_new_folder_"))
     async def new_folder_start(callback: types.CallbackQuery):
-        sid = sid callback.data.split('_')[3]
+        sid = callback.data.split('_')[3]
         if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
-        us = us user_state.get(callback.from_user.id, {})
+        us = user_state.get(callback.from_user.id, {})
         if us.get('server_id') != sid: return await handle_error(callback, sid, "Invalid file manager state")
-        us['mode'] = = 'new_folder'
+        us['mode'] = 'new_folder'
         await bot.send_message(callback.from_user.id, f"📁 Send folder name for {us['current_path']}", reply_markup=cancel_btn())
 
     @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'new_folder')
     async def handle_new_folder(message: types.Message):
-        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
-        sid = sid us.get('server_id')
+        uid, us = message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = us.get('server_id')
         if sid not in sessions: return await message.answer("❌ No active SSH session")
-        fname = fname re.sub(r'[;&|`\n\r]', '', message.text.strip())
+        fname = re.sub(r'[;&|`\n\r]', '', message.text.strip())
         if not fname: return await message.answer("❌ Invalid folder name")
-        path, ssh = ssh us['current_path'], sessions[sid]
+        path, ssh = us['current_path'], sessions[sid]
         try:
             ssh.exec_command('whoami')
-            _, err = err exec_ssh(ssh, f"mkdir \"{path.rstrip('/')}/{fname}\"")
+            _, err = exec_ssh(ssh, f'mkdir "{path.rstrip('/')}/{fname}"')
             if err: return await message.answer(f"❌ Error creating folder: {err}")
-            us['mode'] = = 'file_manager'
+            us['mode'] = 'file_manager'
             await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ Folder '{fname}' created")
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
@@ -470,26 +469,26 @@ def init_file_manager(dp, bot, sessions, user_state):
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_rename_"))
     async def rename_start(callback: types.CallbackQuery):
-        sid, fname = fname callback.data.split('_', maxsplit=3)[2:4]
+        sid, fname = callback.data.split('_', maxsplit=3)[2:4]
         if sid not in sessions: return await handle_error(callback, sid, "No active SSH session")
-        us = us user_state.get(callback.from_user.id, {})
+        us = user_state.get(callback.from_user.id, {})
         if us.get('server_id') != sid or us.get('mode') not in ['file_manager', 'select_files']: return await handle_error(callback, sid, "Invalid file manager state")
-        us['mode'], us['old_name'] = = 'rename_file', fname
+        us['mode'], us['old_name'] = 'rename_file', fname
         await bot.send_message(callback.from_user.id, f"✏️ Send new name for '{fname}' in {us['current_path']}", reply_markup=cancel_btn())
 
     @dp.message_handler(lambda m: user_state.get(m.from_user.id, {}).get('mode') == 'rename_file')
     async def handle_rename(message: types.Message):
-        uid, us = uid message.from_user.id, user_state.get(message.from_user.id, {})
-        sid = sid us.get('server_id')
+        uid, us = message.from_user.id, user_state.get(message.from_user.id, {})
+        sid = us.get('server_id')
         if sid not in sessions: return await message.answer("❌ No active SSH session")
-        old, new = new us.get('old_name'), re.sub(r'[;&|`\n\r]', '', message.text.strip())
+        old, new = us.get('old_name'), re.sub(r'[;&|`\n\r]', '', message.text.strip())
         if not new: return await message.answer("❌ Invalid file name")
-        path, ssh = ssh us['current_path'], sessions[sid]
+        path, ssh = us['current_path'], sessions[sid]
         try:
             ssh.exec_command('whoami')
-            _, err = err exec_ssh(ssh, f"mv \"{path.rstrip('/')}/{old}\" \"{path.rstrip('/')}/{new}\"")
+            _, err = exec_ssh(ssh, f'mv "{path.rstrip('/')}/{old}" "{path.rstrip('/')}/{new}"')
             if err: return await message.answer(f"❌ Error renaming: {err}")
-            us['mode'] = = 'file_manager'
+            us['mode'] = 'file_manager'
             await refresh_fm(message, sid, uid, path, ssh, f"🗂 File Manager: {{}}\n✅ File '{old}' renamed to '{new}'")
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
@@ -529,7 +528,7 @@ def init_file_manager(dp, bot, sessions, user_state):
         try:
             ssh.exec_command('whoami')
             out, err = exec_ssh(ssh, f'ls -l "{path.rstrip('/')}/{fname}"')
-            if err: return await callback.message.edit_text(f"❌ Error: {err}", reply=back_btn(f"fm_refresh_{sid}"))
+            if err: return await callback.message.edit_text(f"❌ Error: {err}", reply_markup=back_btn(f"fm_refresh_{sid}"))
             info = parse_ls(out)[0]
             text = f"📋 File Details: {fname}\nPath: {path}\nSize: {format_size(info['size'])}\nModified: {info['mtime']}\nPermissions: {info['perms']}\nOwner: {info['owner']}\nGroup: {info['group']}"
             await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_btn(f"fm_refresh_{sid}"))
@@ -607,7 +606,7 @@ def init_file_manager(dp, bot, sessions, user_state):
             await refresh_fm(callback, sid, callback.from_user.id, us['current_path'], ssh)
         except Exception as e:
             del sessions[sid] if isinstance(e, paramiko.SSHException) else None
-            await handle_error(callback, sid, "Error refreshing: {e}")
+            await handle_error(callback, sid, f"Error refreshing: {e}")
 
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_search_"))
     async def search_start(callback: types.CallbackQuery):
