@@ -5,19 +5,25 @@ import paramiko
 import base64
 from aiogram import Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
-    @dp.callback_query_handler(lambda c: c.data.startswith("fm_") or c.data.startswith("file_") or c.data.startswith("select_") or c.data.startswith("zip_") or c.data.startswith("unzip_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith(("fm_", "file_", "select_", "zip_", "unzip_")))
     async def handle_file_actions(callback: types.CallbackQuery):
         try:
             data = callback.data.split("_")
             action = data[0]
             server_id = data[1]
             path_b64 = "_".join(data[2:]) if len(data) > 2 else ""
-            current_path = base64.b64decode(path_b64).decode() if path_b64 else "/home/ubuntu"
+            try:
+                current_path = base64.b64decode(path_b64).decode('utf-8', errors='replace') if path_b64 else "/home/ubuntu"
+            except Exception as e:
+                logger.error(f"Base64 decode error for path_b64={path_b64}: {e}")
+                await callback.message.edit_text("❌ Invalid path encoding.")
+                return
             ssh = active_sessions.get(server_id)
             if not ssh:
                 await callback.message.edit_text("❌ No active SSH session.")
@@ -31,27 +37,26 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
                 user_input[uid]["selected_items"] = []
                 await list_files(callback.message, server_id, current_path, bot, user_input)
             elif action == "file":
-                file_name = base64.b64decode("_".join(data[2:])).decode()
-                await show_file_options(callback, server_id, os.path.join(current_path, file_name), user_input)
+                file_path = base64.b64decode("_".join(data[2:])).decode('utf-8', errors='replace')
+                await show_file_options(callback, server_id, file_path, user_input)
             elif action == "select":
                 await toggle_select_mode(callback, server_id, current_path, user_input)
             elif action == "zip":
                 await zip_selected(callback, server_id, current_path, user_input)
             elif action == "unzip":
-                zip_path = base64.b64decode("_".join(data[2:])).decode()
+                zip_path = base64.b64decode("_".join(data[2:])).decode('utf-8', errors='replace')
                 await unzip_file(callback, server_id, zip_path, current_path, user_input)
             else:
-                # Handle file-specific actions (download, delete, etc.)
-                file_path = base64.b64decode("_".join(data[1:])).decode()
+                file_path = base64.b64decode("_".join(data[1:])).decode('utf-8', errors='replace')
                 if action == "download":
                     try:
                         sftp = ssh.open_sftp()
                         stat = sftp.stat(file_path)
-                        if stat.st_size > 50 * 1024 * 1024:  # 50MB limit
+                        if stat.st_size > 50 * 1024 * 1024:
                             await callback.message.edit_text("❌ File too large (>50MB) for Telegram.")
                             sftp.close()
                             return
-                        with sftp.file(file_path, 'r') as remote_file:
+                        with sftp.file(file_path, 'rb') as remote_file:
                             file_content = remote_file.read()
                         sftp.close()
                         file_io = io.BytesIO(file_content)
@@ -64,7 +69,8 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
                 elif action == "delete":
                     try:
                         sftp = ssh.open_sftp()
-                        if os.path.basename(file_path).startswith(".") or file_path.endswith("/"):
+                        is_dir = sftp.lstat(file_path).st_mode & 0o40000
+                        if is_dir:
                             sftp.rmdir(file_path)
                         else:
                             sftp.remove(file_path)
@@ -79,14 +85,14 @@ def init_file_manager(dp: Dispatcher, bot, active_sessions, user_input):
                         "path": current_path,
                         "action": "upload"
                     }
-                    await callback.message.edit_text("📤 Please send the file to upload.", reply_markup=back_button(f"fm_{server_id}_{base64.b64encode(current_path.encode()).decode()}"))
+                    await callback.message.edit_text("📤 Please send the file to upload.", reply_markup=back_button(f"fm_{server_id}_{base64.b64encode(current_path.encode('utf-8')).decode()}"))
                 elif action == "download_selected":
                     await download_selected(callback, server_id, user_input)
                 elif action == "delete_selected":
                     await delete_selected(callback, server_id, user_input)
                 await list_files(callback.message, server_id, current_path, bot, user_input)
         except Exception as e:
-            logger.error(f"File action error: {e}")
+            logger.error(f"File action error: {str(e)}")
             await callback.message.edit_text(f"❌ Error: {str(e)}")
 
     @dp.message_handler(content_types=types.ContentType.DOCUMENT)
@@ -132,12 +138,20 @@ async def list_files(message: types.Message, server_id: str, path: str, bot, use
             await message.edit_text("❌ No active SSH session.")
             return
         stdin, stdout, stderr = ssh.exec_command(f'ls -1 "{path}"')
-        ls_output = stdout.read().decode().strip()
-        stderr_output = stderr.read().decode().strip()
-        logger.debug(f"ls -1 output for {path}: {ls_output}")
+        raw_output = stdout.read()
+        raw_stderr = stderr.read()
+        logger.debug(f"Raw ls -1 output for {path}: {raw_output!r}")
+        logger.debug(f"Raw ls -1 stderr for {path}: {raw_stderr!r}")
+        try:
+            ls_output = raw_output.decode('utf-8', errors='replace').strip()
+            stderr_output = raw_stderr.decode('utf-8', errors='replace').strip()
+        except Exception as e:
+            logger.error(f"Decode error in ls -1 output: {e}, raw: {raw_output!r}")
+            await message.edit_text("❌ Error listing files: Invalid filename encoding.")
+            return
         if stderr_output:
             logger.warning(f"ls error: {stderr_output}")
-        files = [f for f in ls_output.splitlines() if not (f.startswith(".") or f.endswith("~") or f.endswith(".bak"))]
+        files = [f for f in ls_output.splitlines() if f and not (f.startswith(".") or f.endswith("~") or f.endswith(".bak"))]
         uid = message.from_user.id
         select_mode = user_input.get(uid, {}).get("select_mode", False)
         selected_items = user_input.get(uid, {}).get("selected_items", [])
@@ -149,16 +163,16 @@ async def list_files(message: types.Message, server_id: str, path: str, bot, use
             sftp.close()
             prefix = "✅" if file_path in selected_items else "⬜"
             label = f"📁 {file}" if is_dir else f"📄 {file}"
-            callback_data = f"file_{server_id}_{base64.b64encode(file_path.encode()).decode()}" if not select_mode else f"select_{server_id}_{base64.b64encode(file_path.encode()).decode()}"
+            callback_data = f"file_{server_id}_{base64.b64encode(file_path.encode('utf-8')).decode()}" if not select_mode else f"select_{server_id}_{base64.b64encode(file_path.encode('utf-8')).decode()}"
             kb.add(InlineKeyboardButton(f"{prefix} {label}", callback_data=callback_data))
-        kb.add(InlineKeyboardButton("⬆️ Parent", callback_data=f"fm_{server_id}_{base64.b64encode(os.path.dirname(path).encode()).decode()}"))
-        kb.add(InlineKeyboardButton("📤 Upload File", callback_data=f"upload_{server_id}_{base64.b64encode(path.encode()).decode()}"))
-        kb.add(InlineKeyboardButton(f"{'❌' if select_mode else '✅'} Select Items", callback_data=f"select_{server_id}_{base64.b64encode(path.encode()).decode()}"))
+        kb.add(InlineKeyboardButton("⬆️ Parent", callback_data=f"fm_{server_id}_{base64.b64encode(os.path.dirname(path).encode('utf-8')).decode()}"))
+        kb.add(InlineKeyboardButton("📤 Upload File", callback_data=f"upload_{server_id}_{base64.b64encode(path.encode('utf-8')).decode()}"))
+        kb.add(InlineKeyboardButton(f"{'❌' if select_mode else '✅'} Select Items", callback_data=f"select_{server_id}_{base64.b64encode(path.encode('utf-8')).decode()}"))
         if select_mode and selected_items:
             kb.add(
-                InlineKeyboardButton("⬇️ Download Selected", callback_data=f"download_selected_{server_id}_{base64.b64encode(path.encode()).decode()}"),
-                InlineKeyboardButton("🗑 Delete Selected", callback_data=f"delete_selected_{server_id}_{base64.b64encode(path.encode()).decode()}"),
-                InlineKeyboardButton("📦 Zip Selected", callback_data=f"zip_{server_id}_{base64.b64encode(path.encode()).decode()}"),
+                InlineKeyboardButton("⬇️ Download Selected", callback_data=f"download_selected_{server_id}_{base64.b64encode(path.encode('utf-8')).decode()}"),
+                InlineKeyboardButton("🗑 Delete Selected", callback_data=f"delete_selected_{server_id}_{base64.b64encode(path.encode('utf-8')).decode()}"),
+                InlineKeyboardButton("📦 Zip Selected", callback_data=f"zip_{server_id}_{base64.b64encode(path.encode('utf-8')).decode()}"),
             )
         await message.edit_text(f"📂 <b>{path}</b>", parse_mode="HTML", reply_markup=kb)
     except Exception as e:
@@ -176,13 +190,13 @@ async def show_file_options(callback: types.CallbackQuery, server_id: str, file_
         sftp.close()
         kb = InlineKeyboardMarkup(row_width=2)
         if is_dir:
-            kb.add(InlineKeyboardButton("📂 Open", callback_data=f"fm_{server_id}_{base64.b64encode(file_path.encode()).decode()}"))
+            kb.add(InlineKeyboardButton("📂 Open", callback_data=f"fm_{server_id}_{base64.b64encode(file_path.encode('utf-8')).decode()}"))
         else:
-            kb.add(InlineKeyboardButton("⬇️ Download", callback_data=f"download_{server_id}_{base64.b64encode(file_path.encode()).decode()}"))
+            kb.add(InlineKeyboardButton("⬇️ Download", callback_data=f"download_{server_id}_{base64.b64encode(file_path.encode('utf-8')).decode()}"))
             if file_path.endswith(".zip"):
-                kb.add(InlineKeyboardButton("📂 Unzip", callback_data=f"unzip_{server_id}_{base64.b64encode(file_path.encode()).decode()}"))
-        kb.add(InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{server_id}_{base64.b64encode(file_path.encode()).decode()}"))
-        kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"fm_{server_id}_{base64.b64encode(os.path.dirname(file_path).encode()).decode()}"))
+                kb.add(InlineKeyboardButton("📂 Unzip", callback_data=f"unzip_{server_id}_{base64.b64encode(file_path.encode('utf-8')).decode()}"))
+        kb.add(InlineKeyboardButton("🗑 Delete", callback_data=f"delete_{server_id}_{base64.b64encode(file_path.encode('utf-8')).decode()}"))
+        kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"fm_{server_id}_{base64.b64encode(os.path.dirname(file_path).encode('utf-8')).decode()}"))
         await callback.message.edit_text(f"📄 <b>{os.path.basename(file_path)}</b>", parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logger.error(f"Show file options error: {e}")
@@ -211,7 +225,7 @@ async def download_selected(callback: types.CallbackQuery, server_id: str, user_
     if not ssh:
         await callback.message.edit_text("❌ No active SSH session.")
         return
-    for file_path in selected_items[:10]:  # Limit to 10 to avoid Telegram rate limits
+    for file_path in selected_items[:10]:
         try:
             sftp = ssh.open_sftp()
             stat = sftp.stat(file_path)
@@ -219,7 +233,7 @@ async def download_selected(callback: types.CallbackQuery, server_id: str, user_
                 await callback.message.answer(f"❌ {os.path.basename(file_path)} too large (>50MB).")
                 sftp.close()
                 continue
-            with sftp.file(file_path, 'r') as remote_file:
+            with sftp.file(file_path, 'rb') as remote_file:
                 file_content = remote_file.read()
             sftp.close()
             file_io = io.BytesIO(file_content)
@@ -269,9 +283,8 @@ async def zip_selected(callback: types.CallbackQuery, server_id: str, current_pa
         await callback.message.edit_text("❌ No active SSH session.")
         return
     try:
-        # Check if zip is installed
         stdin, stdout, stderr = ssh.exec_command("command -v zip")
-        zip_path = stdout.read().decode().strip()
+        zip_path = stdout.read().decode('utf-8', errors='replace').strip()
         if not zip_path:
             await callback.message.edit_text("❌ 'zip' command not found on server. Install with: sudo apt-get install zip")
             return
@@ -280,9 +293,11 @@ async def zip_selected(callback: types.CallbackQuery, server_id: str, current_pa
         files = [os.path.basename(f) for f in selected_items]
         cmd = f"cd {current_path} && zip -r {zip_name} {' '.join(files)}"
         stdin, stdout, stderr = ssh.exec_command(cmd)
-        stderr_output = stderr.read().decode().strip()
-        stdout_output = stdout.read().decode().strip()
-        logger.debug(f"Zip command: {cmd}, Output: {stdout_output}, Error: {stderr_output}")
+        raw_stdout = stdout.read()
+        raw_stderr = stderr.read()
+        logger.debug(f"Zip command: {cmd}, Raw output: {raw_stdout!r}, Raw error: {raw_stderr!r}")
+        stdout_output = raw_stdout.decode('utf-8', errors='replace').strip()
+        stderr_output = raw_stderr.decode('utf-8', errors='replace').strip()
         if stderr_output:
             raise paramiko.SSHException(f"Zip error: {stderr_output}")
         await callback.message.edit_text(f"✅ Created {zip_name}.")
@@ -300,17 +315,18 @@ async def unzip_file(callback: types.CallbackQuery, server_id: str, zip_path: st
         await callback.message.edit_text("❌ No active SSH session.")
         return
     try:
-        # Check if unzip is installed
         stdin, stdout, stderr = ssh.exec_command("command -v unzip")
-        unzip_path = stdout.read().decode().strip()
+        unzip_path = stdout.read().decode('utf-8', errors='replace').strip()
         if not unzip_path:
             await callback.message.edit_text("❌ 'unzip' command not found on server. Install with: sudo apt-get install unzip")
             return
         cmd = f"cd {current_path} && unzip -o {os.path.basename(zip_path)}"
         stdin, stdout, stderr = ssh.exec_command(cmd)
-        stderr_output = stderr.read().decode().strip()
-        stdout_output = stdout.read().decode().strip()
-        logger.debug(f"Unzip command: {cmd}, Output: {stdout_output}, Error: {stderr_output}")
+        raw_stdout = stdout.read()
+        raw_stderr = stderr.read()
+        logger.debug(f"Unzip command: {cmd}, Raw output: {raw_stdout!r}, Raw error: {raw_stderr!r}")
+        stdout_output = raw_stdout.decode('utf-8', errors='replace').strip()
+        stderr_output = raw_stderr.decode('utf-8', errors='replace').strip()
         if stderr_output:
             raise paramiko.SSHException(f"Unzip error: {stderr_output}")
         await callback.message.edit_text(f"✅ Unzipped {os.path.basename(zip_path)}.")
@@ -319,5 +335,3 @@ async def unzip_file(callback: types.CallbackQuery, server_id: str, zip_path: st
         await callback.message.edit_text(f"❌ Failed to unzip: {str(e)}")
     finally:
         await list_files(callback.message, server_id, current_path, bot, user_input)
-
-from datetime import datetime
