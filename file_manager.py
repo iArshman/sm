@@ -256,22 +256,43 @@ def init_file_manager(dp, bot, active_sessions, user_input):
     async def file_manager_start(callback: types.CallbackQuery):
         await callback.answer()
         try:
-            _, server_id, _ = parse_callback_data(callback.data)
+            action, server_id, rest = parse_callback_data(callback.data)
+            if not server_id:
+                logger.error(f"Invalid callback data: {callback.data}")
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                return
+
             from main import get_ssh_session, get_server_by_id  # Delayed import
             # Check if session exists, otherwise attempt to create it
             if server_id not in active_sessions:
+                logger.info(f"No active session for server {server_id}, attempting to create one")
                 server = await get_server_by_id(server_id)
                 if not server:
                     logger.error(f"Server {server_id} not found")
-                    await callback.message.edit_text("❌ Server not found.", reply_markup=back_button(f"server_{server_id}"))
+                    await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("server_menu"))
+                    return
+                if not all(key in server for key in ['ip', 'username', 'key_content']):
+                    logger.error(f"Invalid server data for server {server_id}: {server}")
+                    await callback.message.edit_text("❌ Invalid server configuration.", reply_markup=back_button("server_menu"))
                     return
                 try:
                     ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
                     active_sessions[server_id] = ssh  # Store the new session
-                except Exception as e:
-                    logger.error(f"Failed to establish SSH session for server {server_id}: {e}")
-                    await callback.message.edit_text("❌ Failed to establish SSH session.", reply_markup=back_button(f"server_{server_id}"))
+                    logger.info(f"SSH session created for server {server_id}")
+                except paramiko.AuthenticationException:
+                    logger.error(f"Authentication failed for server {server_id}")
+                    await callback.message.edit_text("❌ Authentication failed. Check SSH credentials.", reply_markup=back_button("server_menu"))
                     return
+                except paramiko.SSHException as ssh_e:
+                    logger.error(f"SSH connection failed for server {server_id}: {ssh_e}")
+                    await callback.message.edit_text("❌ Failed to connect to server. Check network or server status.", reply_markup=back_button("server_menu"))
+                    return
+                except Exception as e:
+                    logger.error(f"Unexpected error creating SSH session for server {server_id}: {e}")
+                    await callback.message.edit_text("❌ Failed to establish SSH session.", reply_markup=back_button("server_menu"))
+                    return
+
+            # Initialize user state
             user_input[callback.from_user.id] = {
                 'server_id': server_id,
                 'current_path': '/home/ubuntu',
@@ -280,8 +301,8 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             }
             await refresh_file_list(callback, server_id, user_input[callback.from_user.id])
         except Exception as e:
-            logger.error(f"File manager start error for server {server_id}, user {callback.from_user.id}: {e}")
-            await callback.message.edit_text("❌ Error loading file manager.", reply_markup=back_button(f"server_{server_id}"))
+            logger.error(f"File manager start error for server {server_id}, user {callback.from_user.id}: {str(e)}", exc_info=True)
+            await callback.message.edit_text(f"❌ Error loading file manager: {html.escape(str(e))}", reply_markup=back_button("server_menu"))
 
     # --- NAVIGATE DIRECTORY ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_nav_"))
