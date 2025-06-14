@@ -123,54 +123,55 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         rest = parts[2] if len(parts) > 2 else ''
         return action, server_id, rest
 
-    # --- HELPER: HANDLE FILE OPERATION ---
-    async def handle_file_operation(server_id, user_state, operation, files, dest_path=None, new_name=None):
-        try:
-            server = await get_server_by_id(server_id)
-            if not server:
-                return None, "Server not found"
-            ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
-            current_path = user_state.get('current_path', '/home/ubuntu')
-            errors = []
-            commands = []
-            
-            for file_name in files:
-                src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-                if operation == 'delete':
-                    commands.append(f'rm -rf "{src_path}"')
-                elif operation == 'copy':
-                    if not dest_path:
-                        return None, "Destination path required"
-                    commands.append(f'cp -r "{src_path}" "{sanitize_path(dest_path)}/"')
-                elif operation == 'move':
-                    if not dest_path:
-                        return None, "Destination path required"
-                    commands.append(f'mv "{src_path}" "{sanitize_path(dest_path)}/"')
-                elif operation == 'rename':
-                    if not new_name:
-                        return None, "New name required"
-                    new_path = sanitize_path(f"{current_path.rstrip('/')}/{new_name}")
-                    commands.append(f'mv "{src_path}" "{new_path}"')
-                elif operation == 'zip':
-                    if not new_name:
-                        return None, "Zip name required"
-                    zip_path = sanitize_path(f"{current_path.rstrip('/')}/{new_name}")
-                    quoted_files = ' '.join(f'"{sanitize_path(f"{current_path.rstrip('/')}/{f}")}"' for f in files)
-                    commands.append(f'cd "{current_path}" && zip -r "{zip_path}" {quoted_files}')
-                elif operation == 'unzip':
-                    commands.append(f'unzip -o "{src_path}" -d "{current_path}"')
-                elif operation == 'mkdir':
-                    commands.append(f'mkdir "{src_path}"')
+# --- HELPER: HANDLE FILE OPERATION ---
+async def handle_file_operation(server_id, user_state, operation, files, dest_path=None, new_name=None):
+    try:
+        server = await get_server_by_id(server_id)
+        if not server:
+            return None, "Server not found"
+        ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+        current_path = user_state.get('current_path', '/home/ubuntu')
+        errors = []
+        commands = []
+        
+        for file_name in files:
+            src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
+            if operation == 'delete':
+                commands.append(f'rm -rf "{src_path}"')
+            elif operation == 'copy':
+                if not dest_path:
+                    return None, "Destination path required"
+                commands.append(f'cp -r "{src_path}" "{sanitize_path(dest_path)}/"')
+            elif operation == 'move':
+                if not dest_path:
+                    return None, "Destination path required"
+                commands.append(f'mv "{src_path}" "{sanitize_path(dest_path)}/"')
+            elif operation == 'rename':
+                if not new_name:
+                    return None, "New name required"
+                new_path = sanitize_path(f"{current_path.rstrip('/')}/{new_name}")
+                commands.append(f'mv "{src_path}" "{new_path}"')
+            elif operation == 'zip':
+                if not new_name:
+                    return None, "Zip name required"
+                zip_path = sanitize_path(f"{current_path.rstrip('/')}/{new_name}")
+                # Fix: Use string concatenation instead of nested f-string
+                quoted_files = ' '.join(f'"{sanitize_path(current_path.rstrip('/') + "/" + f)}"' for f in files)
+                commands.append(f'cd "{current_path}" && zip -r "{zip_path}" {quoted_files}')
+            elif operation == 'unzip':
+                commands.append(f'unzip -o "{src_path}" -d "{current_path}"')
+            elif operation == 'mkdir':
+                commands.append(f'mkdir "{src_path}"')
 
-            for command in commands:
-                _, stderr_data = execute_ssh_command(ssh, command)
-                if stderr_data:
-                    errors.append(stderr_data)
+        for command in commands:
+            _, stderr_data = execute_ssh_command(ssh, command)
+            if stderr_data:
+                errors.append(stderr_data)
 
-            return None, "\n".join(errors) if errors else None
-        except Exception as e:
-            logger.error(f"File operation '{operation}' error for server {server_id}: {e}")
-            return None, str(e)
+        return None, "\n".join(errors) if errors else None
+    except Exception as e:
+        logger.error(f"File operation '{operation}' error: {e}")
+        return None, str(e)
 
     # --- HELPER: BUILD FILE KEYBOARD ---
     def build_file_keyboard(server_id, path, files, user_id):
