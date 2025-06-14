@@ -229,65 +229,87 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Navigate directory error for server {server_id}: {e}")
             await callback.message.edit_text("❌ Error navigating directory.", reply_markup=back_button(f"server_{server_id}"))
 
-    # --- TOGGLE FILE SELECTION ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("fm_toggle_select_"))
-    async def toggle_file_selection(callback: types.CallbackQuery):
+# --- ENTER SELECTION MODE ---
+@dp.callback_query_handler(lambda c: c.data.startswith("fm_select_mode_"))
+async def enter_selection_mode(callback: types.CallbackQuery):
+    try:
+        server_id = callback.data.split('_')[3]
+        logger.debug(f"Entering selection mode for server_id: {server_id}, active_sessions: {list(active_sessions.keys())}")
+        if server_id not in active_sessions:
+            logger.error(f"No active SSH session for server_id: {server_id}")
+            await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
+            return
+        user_state = user_input.get(callback.from_user.id, {})
+        if user_state.get('server_id') != server_id:
+            logger.warning(f"Server ID mismatch: user_state server_id={user_state.get('server_id')}, callback server_id={server_id}")
+            await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
+            return
+        user_state['mode'] = 'select_files'
+        user_state['selected_files'] = set()
+        current_path = user_state['current_path']
+        ssh = active_sessions[server_id]
         try:
-            parts = callback.data.split('_', maxsplit=3)
-            server_id = parts[2]
-            file_name = parts[3]
-            if server_id not in active_sessions:
-                await callback.message.edit_text("❌ No active SSH session.")
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
-                await callback.message.edit_text("❌ Invalid file manager state.")
-                return
-            current_path = user_state['current_path']
-            selected_files = user_state.get('selected_files', set())
-            if file_name in selected_files:
-                selected_files.remove(file_name)
-            else:
-                selected_files.add(file_name)
-            user_state['selected_files'] = selected_files
-            ssh = active_sessions[server_id]
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}\n☑️ Selected: {len(selected_files)} item(s)"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')  # Test SSH connection
         except Exception as e:
-            logger.error(f"Toggle selection error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error selecting file.", reply_markup=back_button(f"server_{server_id}"))
+            logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
+            del active_sessions[server_id]  # Remove invalid session
+            await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
+            return
+        files, error = await get_file_list(server_id, current_path, ssh)
+        if error:
+            logger.error(f"Failed to list files: {error}")
+            await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
+            return
+        kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
+        text = f"🗂 File Manager: {current_path}\n☑️ Selection Mode: Click ☑️ to select files"
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Enter selection mode error for server {server_id}: {e}")
+        await callback.message.edit_text("❌ Error entering selection mode.", reply_markup=back_button(f"server_{server_id}"))
 
-    # --- ENTER SELECTION MODE ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("fm_select_mode_"))
-    async def enter_selection_mode(callback: types.CallbackQuery):
+# --- TOGGLE FILE SELECTION ---
+@dp.callback_query_handler(lambda c: c.data.startswith("fm_toggle_select_"))
+async def toggle_file_selection(callback: types.CallbackQuery):
+    try:
+        parts = callback.data.split('_', maxsplit=3)
+        server_id = parts[2]
+        file_name = parts[3]
+        logger.debug(f"Toggling selection for server_id: {server_id}, file: {file_name}, active_sessions: {list(active_sessions.keys())}")
+        if server_id not in active_sessions:
+            logger.error(f"No active SSH session for server_id: {server_id}")
+            await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
+            return
+        user_state = user_input.get(callback.from_user.id, {})
+        if user_state.get('server_id') != server_id or user_state.get('mode') != 'select_files':
+            logger.warning(f"Invalid state: server_id={user_state.get('server_id')}, mode={user_state.get('mode')}")
+            await callback.message.edit_text("❌ Invalid file manager state.", reply_markup=back_button(f"server_{server_id}"))
+            return
+        current_path = user_state['current_path']
+        selected_files = user_state.get('selected_files', set())
+        if file_name in selected_files:
+            selected_files.remove(file_name)
+        else:
+            selected_files.add(file_name)
+        user_state['selected_files'] = selected_files
+        ssh = active_sessions[server_id]
         try:
-            server_id = callback.data.split('_')[3]
-            if server_id not in active_sessions:
-                await callback.message.edit_text("❌ No active SSH session.")
-                return
-            user_state = user_input.get(callback.from_user.id, {})
-            if user_state.get('server_id') != server_id:
-                await callback.message.edit_text("❌ Invalid file manager state.")
-                return
-            user_state['mode'] = 'select_files'
-            user_state['selected_files'] = set()
-            current_path = user_state['current_path']
-            ssh = active_sessions[server_id]
-            files, error = await get_file_list(server_id, current_path, ssh)
-            if error:
-                await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
-                return
-            kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
-            text = f"🗂 File Manager: {current_path}\n☑️ Selection Mode: Click ☑️ to select files"
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            ssh.exec_command('whoami')  # Test SSH connection
         except Exception as e:
-            logger.error(f"Enter selection mode error for server {server_id}: {e}")
-            await callback.message.edit_text("❌ Error entering selection mode.", reply_markup=back_button(f"server_{server_id}"))
+            logger.error(f"SSH connection test failed for server_id {server_id}: {e}")
+            del active_sessions[server_id]  # Remove invalid session
+            await callback.message.edit_text("❌ SSH session expired. Please reconnect.", reply_markup=back_button(f"server_{server_id}"))
+            return
+        files, error = await get_file_list(server_id, current_path, ssh)
+        if error:
+            logger.error(f"Failed to list files: {error}")
+            await callback.message.edit_text(f"❌ Error: {error}", reply_markup=back_button(f"server_{server_id}"))
+            return
+        kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
+        text = f"🗂 File Manager: {current_path}\n☑️ Selected: {len(selected_files)} item(s)"
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Toggle selection error for server {server_id}: {e}")
+        await callback.message.edit_text("❌ Error selecting file.", reply_markup=back_button(f"server_{server_id}"))
 
     # --- SHOW SELECTION ACTIONS ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_selection_actions_"))
