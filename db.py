@@ -30,7 +30,7 @@ async def update_server_name(server_id, new_name):
             {"$set": {"name": new_name}}
         )
     except Exception as e:
-        logging.error(f"Error updating name for server {server_id}: {e}")
+        logging.error(f"Error updating name for server {server_id}: {e}") 
 
 async def update_server_username(server_id, new_username):
     try:
