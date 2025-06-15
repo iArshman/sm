@@ -9,7 +9,7 @@ from paramiko import SFTPClient, SSHException
 
 logger = logging.getLogger(__name__)
 
-# Configuration
+# Configuration 
 ALLOWED_USERS = [7405203657]  # Restrict bot access to these Telegram user IDs
 ITEMS_PER_PAGE = 20  # Number of files per page
 path_mapping = {}  # Store callback data mappings
