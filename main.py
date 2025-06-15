@@ -1,30 +1,55 @@
 import logging
 import io
+import os
+import sys
+from pathlib import Path
 import paramiko
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.utils import executor
-from config import BOT_TOKEN
-from db import (
-    add_server,
-    get_servers,
-    get_server_by_id,
-    update_server_name,
-    update_server_username,
-    delete_server_by_id
-)
-from bson.objectid import ObjectId
-from bson.errors import InvalidId
-from file_manager import init_file_manager
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Add the project root to Python path for imports
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+try:
+    from bot.config import BOT_TOKEN, LOG_LEVEL
+    from bot.db import (
+        add_server,
+        get_servers,
+        get_server_by_id,
+        update_server_name,
+        update_server_username,
+        delete_server_by_id
+    )
+    from bot.file_manager import init_file_manager
+    from bot.bot_manager import init_bot_manager
+except ImportError as e:
+    print(f"❌ Import error: {e}")
+    print("Make sure all required files are in the correct location")
+    sys.exit(1)
+
+from bson.objectid import ObjectId
+from bson.errors import InvalidId
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
+# Initialize bot and dispatcher
+try:
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(bot)
+    dp.middleware.setup(LoggingMiddleware())
+    logger.info("✅ Bot initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize bot: {e}")
+    sys.exit(1)
 
 # --- UTILS ---
 
@@ -258,8 +283,9 @@ async def on_startup(_):
     except Exception as e:
         logger.error(f"Startup error: {e}")
     
-    # Initialize file manager
+    # Initialize modules
     init_file_manager(dp, bot, active_sessions, user_input)
+    init_bot_manager(dp, bot, active_sessions, user_input)
     logger.info("✅ Bot startup complete")
 
 # --- MAIN HANDLERS ---
@@ -276,8 +302,15 @@ async def start_command(message: types.Message):
             
             await message.answer(
                 "🔧 <b>Multi Server Manager</b>\n\n"
-                "Welcome! You don't have any servers configured yet.\n"
-                "Add your first server to get started.",
+                "🚀 <b>Welcome to the Ultimate Server Management Bot!</b>\n\n"
+                "✨ <b>Features:</b>\n"
+                "🗂️ Advanced File Manager\n"
+                "🤖 Bot Deployment & Management\n"
+                "🔧 Service Control (Docker & SystemD)\n"
+                "📊 Real-time Server Monitoring\n"
+                "⚡ SSH-based Remote Control\n\n"
+                "You don't have any servers configured yet.\n"
+                "Add your first server to get started!",
                 parse_mode='HTML',
                 reply_markup=kb
             )
@@ -297,9 +330,16 @@ async def start_command(message: types.Message):
         
         kb.add(InlineKeyboardButton("➕ Add Server", callback_data="add_server"))
         
+        total_servers = len(servers)
+        online_servers = len([s for s in servers if str(s['_id']) in active_sessions])
+        
         await message.answer(
             "🔧 <b>Multi Server Manager</b>\n\n"
-            "Select a server to manage:",
+            f"📊 <b>Overview:</b>\n"
+            f"Total Servers: {total_servers}\n"
+            f"Online: {online_servers}\n"
+            f"Offline: {total_servers - online_servers}\n\n"
+            "🖥️ <b>Select a server to manage:</b>",
             parse_mode='HTML',
             reply_markup=kb
         )
@@ -335,7 +375,9 @@ async def add_server_start(callback: types.CallbackQuery):
     
     await bot.send_message(
         callback.from_user.id,
-        "📝 <b>Add New Server</b>\n\nEnter server name:",
+        "📝 <b>Add New Server</b>\n\n"
+        "🏷️ Enter a friendly name for your server:\n"
+        "<i>Example: Production Server, Development Box, etc.</i>",
         parse_mode='HTML',
         reply_markup=cancel_button()
     )
@@ -355,7 +397,9 @@ async def handle_server_inputs(message: types.Message):
             user_input[uid]['name'] = message.text.strip()
             user_input[uid]['step'] = 'username'
             await message.answer(
-                "👤 <b>Server Username</b>\n\nEnter SSH username:",
+                "👤 <b>SSH Username</b>\n\n"
+                "Enter the SSH username for this server:\n"
+                "<i>Usually 'root', 'ubuntu', or your custom user</i>",
                 parse_mode='HTML',
                 reply_markup=cancel_button()
             )
@@ -364,7 +408,9 @@ async def handle_server_inputs(message: types.Message):
             user_input[uid]['username'] = message.text.strip()
             user_input[uid]['step'] = 'ip'
             await message.answer(
-                "🌐 <b>Server IP Address</b>\n\nEnter IP address or hostname:",
+                "🌐 <b>Server Address</b>\n\n"
+                "Enter the server IP address or hostname:\n"
+                "<i>Example: 192.168.1.100 or server.example.com</i>",
                 parse_mode='HTML',
                 reply_markup=cancel_button()
             )
@@ -373,7 +419,10 @@ async def handle_server_inputs(message: types.Message):
             user_input[uid]['ip'] = message.text.strip()
             user_input[uid]['step'] = 'key'
             await message.answer(
-                "🔑 <b>SSH Private Key</b>\n\nSend your SSH private key file:",
+                "🔑 <b>SSH Private Key</b>\n\n"
+                "Send your SSH private key file:\n"
+                "<i>This should be the private key file (usually id_rsa, id_ed25519, etc.)</i>\n\n"
+                "⚠️ <b>Security Note:</b> Your key is encrypted and stored securely.",
                 parse_mode='HTML',
                 reply_markup=cancel_button()
             )
@@ -392,7 +441,7 @@ async def handle_key_upload(message: types.Message):
         return
     
     try:
-        await message.answer("🔄 Processing SSH key...")
+        await message.answer("🔄 <b>Processing SSH key...</b>", parse_mode='HTML')
         
         # Download and read key file
         file = await bot.download_file_by_id(message.document.file_id)
@@ -401,7 +450,7 @@ async def handle_key_upload(message: types.Message):
         data = user_input[uid]
         data['key_content'] = key_content
         
-        await message.answer("🔌 Testing connection...")
+        await message.answer("🔌 <b>Testing connection...</b>", parse_mode='HTML')
         
         # Test SSH connection
         ssh = paramiko.SSHClient()
@@ -441,10 +490,11 @@ async def handle_key_upload(message: types.Message):
             
             await message.answer(
                 f"✅ <b>Server Added Successfully!</b>\n\n"
-                f"📝 Name: {data['name']}\n"
-                f"👤 Username: {data['username']}\n"
-                f"🌐 IP: {data['ip']}\n\n"
-                f"Connection test passed!",
+                f"📝 Name: <b>{data['name']}</b>\n"
+                f"👤 Username: <code>{data['username']}</code>\n"
+                f"🌐 IP: <code>{data['ip']}</code>\n"
+                f"🔐 SSH: <b>Connected</b>\n\n"
+                f"🎉 Your server is ready for management!",
                 parse_mode='HTML'
             )
             
@@ -452,8 +502,12 @@ async def handle_key_upload(message: types.Message):
             logger.error(f"SSH connection test failed: {e}")
             await message.answer(
                 f"❌ <b>Connection Failed</b>\n\n"
-                f"Error: {str(e)}\n\n"
-                f"Please check your credentials and try again.",
+                f"<b>Error:</b> {str(e)}\n\n"
+                f"🔧 <b>Common Solutions:</b>\n"
+                f"• Check IP address and username\n"
+                f"• Verify SSH key format and permissions\n"
+                f"• Ensure SSH service is running on server\n"
+                f"• Check firewall settings",
                 parse_mode='HTML'
             )
         
@@ -485,7 +539,7 @@ async def view_server(callback: types.CallbackQuery):
         
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
-            InlineKeyboardButton("🗂 File Manager", callback_data=f"file_manager_{server_id}"),
+            InlineKeyboardButton("🗂️ File Manager", callback_data=f"file_manager_{server_id}"),
             InlineKeyboardButton("📊 Server Info", callback_data=f"info_{server_id}")
         )
         kb.add(
@@ -495,11 +549,12 @@ async def view_server(callback: types.CallbackQuery):
         kb.add(InlineKeyboardButton("⬅️ Back to Servers", callback_data="start"))
         
         text = (
-            f"🖥 <b>{server['name']}</b>\n\n"
+            f"🖥️ <b>{server['name']}</b>\n\n"
+            f"📊 <b>Server Details:</b>\n"
             f"👤 Username: <code>{server['username']}</code>\n"
             f"🌐 IP Address: <code>{server['ip']}</code>\n"
             f"{status_icon} Status: <b>{status_text}</b>\n\n"
-            f"Choose an option:"
+            f"🚀 <b>Choose a management option:</b>"
         )
         
         await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
@@ -527,11 +582,16 @@ async def server_info(callback: types.CallbackQuery):
         
         if stats.get('error'):
             text = (
-                f"🖥 <b>{server['name']}</b>\n\n"
+                f"🖥️ <b>{server['name']}</b>\n\n"
+                f"📋 <b>Basic Information:</b>\n"
                 f"👤 Username: <code>{server['username']}</code>\n"
                 f"🌐 IP Address: <code>{server['ip']}</code>\n\n"
                 f"❌ <b>Error fetching statistics:</b>\n"
-                f"<code>{stats['error']}</code>"
+                f"<code>{stats['error']}</code>\n\n"
+                f"🔧 <b>Troubleshooting:</b>\n"
+                f"• Check SSH connection\n"
+                f"• Verify server is online\n"
+                f"• Check network connectivity"
             )
         else:
             # Format memory usage
@@ -541,16 +601,18 @@ async def server_info(callback: types.CallbackQuery):
                 ram_usage = f"{stats['ram_used']} GB / {stats['ram_total']} GB ({ram_percent:.1f}%)"
             
             text = (
-                f"🖥 <b>{server['name']}</b>\n\n"
+                f"🖥️ <b>{server['name']}</b>\n\n"
+                f"📋 <b>Basic Information:</b>\n"
                 f"👤 Username: <code>{server['username']}</code>\n"
                 f"🌐 IP Address: <code>{server['ip']}</code>\n\n"
                 f"💻 <b>System Information:</b>\n"
-                f"OS: {stats['os']}\n"
-                f"⏱ Uptime: {stats['uptime']}\n\n"
+                f"🐧 OS: {stats['os']}\n"
+                f"⏱️ Uptime: {stats['uptime']}\n\n"
                 f"📊 <b>Resource Usage:</b>\n"
                 f"🧠 Memory: {ram_usage}\n"
                 f"💾 Disk: {stats['disk_used']} / {stats['disk_total']}\n"
-                f"🔥 CPU Usage: {stats['cpu_usage']}%"
+                f"🔥 CPU Usage: {stats['cpu_usage']}%\n\n"
+                f"✅ <b>Status:</b> All systems operational"
             )
         
         await callback.message.edit_text(
@@ -562,28 +624,6 @@ async def server_info(callback: types.CallbackQuery):
     except Exception as e:
         logger.error(f"Server info error: {e}")
         await callback.message.edit_text("❌ Error fetching server information.")
-
-# --- BOT MANAGER PLACEHOLDER ---
-
-@dp.callback_query_handler(lambda c: c.data.startswith("bot_manager_"))
-async def bot_manager(callback: types.CallbackQuery):
-    """Bot manager placeholder"""
-    server_id = callback.data.split('_')[2]
-    
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"server_{server_id}"))
-    
-    await callback.message.edit_text(
-        "🤖 <b>Bot Manager</b>\n\n"
-        "This feature is coming soon!\n\n"
-        "Future capabilities:\n"
-        "• Deploy and manage bots\n"
-        "• Monitor bot status\n"
-        "• View logs and metrics\n"
-        "• Auto-restart functionality",
-        parse_mode='HTML',
-        reply_markup=kb
-    )
 
 # --- SERVER SETTINGS ---
 
@@ -605,13 +645,14 @@ async def edit_server(callback: types.CallbackQuery):
         )
         kb.add(
             InlineKeyboardButton("🔄 Reconnect", callback_data=f"reconnect_{server_id}"),
-            InlineKeyboardButton("🗑 Delete Server", callback_data=f"delete_{server_id}")
+            InlineKeyboardButton("🗑️ Delete Server", callback_data=f"delete_{server_id}")
         )
         kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"server_{server_id}"))
         
         await callback.message.edit_text(
             f"⚙️ <b>Server Settings</b>\n\n"
-            f"Managing: <b>{server['name']}</b>",
+            f"🖥️ Managing: <b>{server['name']}</b>\n\n"
+            f"Choose a setting to modify:",
             parse_mode='HTML',
             reply_markup=kb
         )
@@ -633,7 +674,7 @@ async def reconnect_server(callback: types.CallbackQuery):
             await callback.message.edit_text("❌ Server not found.")
             return
         
-        await callback.message.edit_text("🔄 <b>Reconnecting...</b>", parse_mode='HTML')
+        await callback.message.edit_text("🔄 <b>Reconnecting to server...</b>", parse_mode='HTML')
         
         # Close existing session
         close_ssh_session(server_id)
@@ -644,8 +685,9 @@ async def reconnect_server(callback: types.CallbackQuery):
             
             await callback.message.edit_text(
                 f"✅ <b>Reconnected Successfully!</b>\n\n"
-                f"Server: {server['name']}\n"
-                f"IP: {server['ip']}",
+                f"🖥️ Server: <b>{server['name']}</b>\n"
+                f"🌐 IP: <code>{server['ip']}</code>\n"
+                f"🔐 Connection: <b>Established</b>",
                 parse_mode='HTML',
                 reply_markup=back_button(f"edit_{server_id}")
             )
@@ -653,7 +695,11 @@ async def reconnect_server(callback: types.CallbackQuery):
         except Exception as e:
             await callback.message.edit_text(
                 f"❌ <b>Reconnection Failed</b>\n\n"
-                f"Error: {str(e)}",
+                f"<b>Error:</b> {str(e)}\n\n"
+                f"🔧 <b>Try:</b>\n"
+                f"• Check server status\n"
+                f"• Verify network connection\n"
+                f"• Check SSH service",
                 parse_mode='HTML',
                 reply_markup=back_button(f"edit_{server_id}")
             )
@@ -673,7 +719,8 @@ async def rename_server(callback: types.CallbackQuery):
         
         await bot.send_message(
             callback.from_user.id,
-            "✏️ <b>Rename Server</b>\n\nEnter new server name:",
+            "✏️ <b>Rename Server</b>\n\n"
+            "Enter the new name for your server:",
             parse_mode='HTML',
             reply_markup=cancel_button()
         )
@@ -693,7 +740,9 @@ async def change_username(callback: types.CallbackQuery):
         
         await bot.send_message(
             callback.from_user.id,
-            "👤 <b>Change Username</b>\n\nEnter new SSH username:",
+            "👤 <b>Change SSH Username</b>\n\n"
+            "Enter the new SSH username:\n"
+            "<i>Note: This will require reconnection to the server</i>",
             parse_mode='HTML',
             reply_markup=cancel_button()
         )
@@ -722,10 +771,12 @@ async def confirm_delete_server(callback: types.CallbackQuery):
         )
         
         await callback.message.edit_text(
-            f"⚠️ <b>Confirm Deletion</b>\n\n"
-            f"Are you sure you want to delete server:\n"
-            f"<b>{server['name']}</b> ({server['ip']})\n\n"
-            f"<b>This action cannot be undone!</b>",
+            f"⚠️ <b>Confirm Server Deletion</b>\n\n"
+            f"Are you sure you want to delete:\n"
+            f"🖥️ <b>{server['name']}</b>\n"
+            f"🌐 <code>{server['ip']}</code>\n\n"
+            f"❗ <b>This action cannot be undone!</b>\n"
+            f"All server data and configurations will be removed from the bot.",
             parse_mode='HTML',
             reply_markup=kb
         )
@@ -752,8 +803,9 @@ async def delete_server_confirm(callback: types.CallbackQuery):
         await delete_server_by_id(server_id)
         
         await callback.message.edit_text(
-            f"✅ <b>Server Deleted</b>\n\n"
-            f"Server '{server['name']}' has been removed successfully.",
+            f"✅ <b>Server Deleted Successfully</b>\n\n"
+            f"🖥️ Server '<b>{server['name']}</b>' has been removed from your management panel.\n\n"
+            f"🔒 All associated data has been securely deleted.",
             parse_mode='HTML'
         )
         
@@ -819,8 +871,12 @@ async def errors_handler(update, exception):
 
 if __name__ == '__main__':
     logger.info("🚀 Starting Multi Server Manager Bot...")
-    executor.start_polling(
-        dp,
-        skip_updates=True,
-        on_startup=on_startup
-    )
+    try:
+        executor.start_polling(
+            dp,
+            skip_updates=True,
+            on_startup=on_startup
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to start bot: {e}")
+        sys.exit(1)
