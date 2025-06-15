@@ -25,7 +25,7 @@ MAX_CONNECTIONS = 10
 
 # File manager configuration
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
-ALLOWED_EXTENSIONS = []
+ALLOWED_EXTENSIONS=.txt,.py,.js,.json,.yml,.yaml,.conf,.jpg
 
 # Logging configuration
 LOG_LEVEL = 'INFO'
