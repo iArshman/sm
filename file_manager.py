@@ -83,7 +83,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
 
     # --- HELPER: GET FILE LIST ---
     async def get_file_list(server_id, path):
-        from main import get_ssh_session, get_server_by_id  # Delayed import
+        from main import get_ssh_session, get_server_by_id
         try:
             server = await get_server_by_id(server_id)
             if not server:
@@ -100,28 +100,36 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             return None, str(e)
 
     # --- HELPER: REFRESH FILE LIST ---
-    async def refresh_file_list(callback, server_id, user_state):
+    async def refresh_file_list(callback_or_message, server_id, user_state):
         current_path = user_state.get('current_path', '/home/ubuntu')
         files, error = await get_file_list(server_id, current_path)
         if error:
-            await callback.message.edit_text(f"❌ Error: {html.escape(error)}", reply_markup=back_button(f"server_{server_id}"))
+            text = f"❌ Error: {html.escape(error)}"
+            kb = back_button(f"server_{server_id}")
+            if isinstance(callback_or_message, types.CallbackQuery):
+                await callback_or_message.message.edit_text(text, reply_markup=kb)
+            else:
+                await callback_or_message.answer(text, reply_markup=kb)
             return False
-        kb = build_file_keyboard(server_id, current_path, files, callback.from_user.id)
+        kb = build_file_keyboard(server_id, current_path, files, callback_or_message.from_user.id)
         text = f"🗂 File Manager: {html.escape(current_path)}"
         if user_state.get('mode') == 'select_files':
             text += f"\n☑️ Selected: {len(user_state.get('selected_files', set()))} item(s)"
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        if isinstance(callback_or_message, types.CallbackQuery):
+            await callback_or_message.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await callback_or_message.answer(text, parse_mode="HTML", reply_markup=kb)
         return True
 
     # --- HELPER: PARSE CALLBACK DATA ---
     def parse_callback_data(data):
         parts = data.split('_', maxsplit=3)
         if len(parts) < 2:
+            logger.warning(f"Invalid callback data format: {data}")
             return None, None, None
         action = parts[0]
         server_id = parts[1]
         rest = parts[2] if len(parts) > 2 else ''
-        # Validate server_id as a 24-character hex string (ObjectId format)
         if not re.match(r'^[0-9a-fA-F]{24}$', server_id):
             logger.warning(f"Invalid server_id format: {server_id}")
             return None, None, None
@@ -129,7 +137,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
 
     # --- HELPER: HANDLE FILE OPERATION ---
     async def handle_file_operation(server_id, user_state, operation, files, dest_path=None, new_name=None):
-        from main import get_ssh_session, get_server_by_id  # Delayed import
+        from main import get_ssh_session, get_server_by_id
         try:
             server = await get_server_by_id(server_id)
             if not server:
@@ -138,7 +146,6 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             current_path = user_state.get('current_path', '/home/ubuntu')
             errors = []
             commands = []
-            
             for file_name in files:
                 src_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
                 if operation == 'delete':
@@ -166,12 +173,10 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                     commands.append(f'unzip -o "{src_path}" -d "{current_path}"')
                 elif operation == 'mkdir':
                     commands.append(f'mkdir "{src_path}"')
-
             for command in commands:
                 _, stderr_data = execute_ssh_command(ssh, command)
                 if stderr_data:
                     errors.append(stderr_data)
-
             return None, "\n".join(errors) if errors else None
         except Exception as e:
             logger.error(f"File operation '{operation}' error for server {server_id}: {e}")
@@ -263,40 +268,36 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             action, server_id, rest = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID. Please select a valid server.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID. Please select a valid server.", reply_markup=back_button("start"))
                 return
-
-            from main import get_ssh_session, get_server_by_id  # Delayed import
-            # Check if session exists, otherwise attempt to create it
+            from main import get_ssh_session, get_server_by_id
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found. It may have been deleted.", reply_markup=back_button("start"))
+                return
             if server_id not in active_sessions:
                 logger.info(f"No active session for server {server_id}, attempting to create one")
-                server = await get_server_by_id(server_id)
-                if not server:
-                    logger.error(f"Server {server_id} not found")
-                    await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("server_menu"))
-                    return
                 if not all(key in server for key in ['ip', 'username', 'key_content']):
                     logger.error(f"Invalid server data for server {server_id}: {server}")
-                    await callback.message.edit_text("❌ Invalid server configuration.", reply_markup=back_button("server_menu"))
+                    await callback.message.edit_text("❌ Invalid server configuration.", reply_markup=back_button("start"))
                     return
                 try:
                     ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
-                    active_sessions[server_id] = ssh  # Store the new session
+                    active_sessions[server_id] = ssh
                     logger.info(f"SSH session created for server {server_id}")
                 except paramiko.AuthenticationException:
                     logger.error(f"Authentication failed for server {server_id}")
-                    await callback.message.edit_text("❌ Authentication failed. Check SSH credentials.", reply_markup=back_button("server_menu"))
+                    await callback.message.edit_text("❌ Authentication failed. Check SSH credentials.", reply_markup=back_button("start"))
                     return
                 except paramiko.SSHException as ssh_e:
                     logger.error(f"SSH connection failed for server {server_id}: {ssh_e}")
-                    await callback.message.edit_text("❌ Failed to connect to server. Check network or server status.", reply_markup=back_button("server_menu"))
+                    await callback.message.edit_text("❌ Failed to connect to server. Check network or server status.", reply_markup=back_button("start"))
                     return
                 except Exception as e:
                     logger.error(f"Unexpected error creating SSH session for server {server_id}: {e}")
-                    await callback.message.edit_text("❌ Failed to establish SSH session.", reply_markup=back_button("server_menu"))
+                    await callback.message.edit_text("❌ Failed to establish SSH session.", reply_markup=back_button("start"))
                     return
-
-            # Initialize user state
             user_input[callback.from_user.id] = {
                 'server_id': server_id,
                 'current_path': '/home/ubuntu',
@@ -306,7 +307,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             await refresh_file_list(callback, server_id, user_input[callback.from_user.id])
         except Exception as e:
             logger.error(f"File manager start error for server {server_id or 'unknown'}, user {callback.from_user.id}: {str(e)}", exc_info=True)
-            await callback.message.edit_text(f"❌ Error loading file manager: {html.escape(str(e))}", reply_markup=back_button("server_menu"))
+            await callback.message.edit_text(f"❌ Error loading file manager: {html.escape(str(e))}", reply_markup=back_button("start"))
 
     # --- NAVIGATE DIRECTORY ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_nav_"))
@@ -316,7 +317,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, dir_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for navigation: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -346,7 +352,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for toggle select: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -376,7 +387,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, _ = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for select mode: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -402,7 +418,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, _ = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for selection actions: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -432,7 +453,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, _ = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for cancel select: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -458,7 +484,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for file actions: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -486,7 +517,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for download: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -499,12 +535,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             current_path = user_state['current_path']
             file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            from main import get_ssh_session, get_server_by_id  # Delayed import
-            server = await get_server_by_id(server_id)
-            if not server:
-                logger.error(f"Server {server_id} not found")
-                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button(f"server_{server_id}"))
-                return
+            from main import get_ssh_session, get_server_by_id
             ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
             sftp = ssh.open_sftp()
             file_stat = sftp.stat(file_path)
@@ -544,7 +575,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             action, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for delete: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -580,7 +616,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, _ = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for delete confirm: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -619,7 +660,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             action, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for copy: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -649,6 +695,11 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             uid = message.from_user.id
             user_state = user_input.get(uid, {})
             server_id = user_state.get('server_id')
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await message.answer("❌ Server not found.")
+                return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
                 await message.answer("❌ No active SSH session.")
@@ -687,7 +738,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             action, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for move: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -717,6 +773,11 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             uid = message.from_user.id
             user_state = user_input.get(uid, {})
             server_id = user_state.get('server_id')
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await message.answer("❌ Server not found.")
+                return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
                 await message.answer("❌ No active SSH session.")
@@ -755,7 +816,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, _ = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for zip: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -784,6 +850,11 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             uid = message.from_user.id
             user_state = user_input.get(uid, {})
             server_id = user_state.get('server_id')
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await message.answer("❌ Server not found.")
+                return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
                 await message.answer("❌ No active SSH session.")
@@ -824,7 +895,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for unzip: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -854,7 +930,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, _ = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for upload: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -883,6 +964,11 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 await message.answer("❌ Not in upload mode.")
                 return
             server_id = user_state.get('server_id')
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await message.answer("❌ Server not found.")
+                return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
                 await message.answer("❌ No active SSH session.")
@@ -896,12 +982,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             current_path = user_state['current_path']
             file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            from main import get_ssh_session, get_server_by_id  # Delayed import
-            server = await get_server_by_id(server_id)
-            if not server:
-                logger.error(f"Server {server_id} not found")
-                await message.answer("❌ Server not found.")
-                return
+            from main import get_ssh_session, get_server_by_id
             ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
             sftp = ssh.open_sftp()
             await message.answer(f"📤 Uploading {html.escape(file_name)} to {html.escape(current_path)}...")
@@ -936,19 +1017,28 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         try:
             user_state = user_input.get(callback.from_user.id, {})
             server_id = user_state.get('server_id')
-            if server_id not in active_sessions:
-                logger.error(f"No active SSH session for server {server_id}")
-                await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
-                return
+            if server_id:
+                server = await get_server_by_id(server_id)
+                if not server:
+                    logger.error(f"Server {server_id} not found in database")
+                    await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
+                    return
+                if server_id not in active_sessions:
+                    logger.error(f"No active SSH session for server {server_id}")
+                    await callback.message.edit_text("❌ No active SSH session.", reply_markup=back_button(f"server_{server_id}"))
+                    return
             user_state['mode'] = 'file_manager'
             user_state['selected_files'] = set()
             user_state.pop('pending_operation', None)
-            await refresh_file_list(callback, server_id, user_state)
-            text = f"🗂 File Manager: {html.escape(user_state['current_path'])}\n✅ Operation cancelled."
-            await callback.message.edit_text(text, parse_mode="HTML")
+            if server_id:
+                await refresh_file_list(callback, server_id, user_state)
+                text = f"🗂 File Manager: {html.escape(user_state['current_path'])}\n✅ Operation cancelled."
+                await callback.message.edit_text(text, parse_mode="HTML")
+            else:
+                await callback.message.edit_text("❌ No active file manager session.", reply_markup=back_button("start"))
         except Exception as e:
-            logger.error(f"Cancel operation error for server {server_id}, user {callback.from_user.id}: {e}")
-            await callback.message.edit_text("❌ Error cancelling operation.", reply_markup=back_button(f"server_{server_id}"))
+            logger.error(f"Cancel operation error for server {server_id or 'unknown'}, user {callback.from_user.id}: {e}")
+            await callback.message.edit_text("❌ Error cancelling operation.", reply_markup=back_button("start"))
 
     # --- NEW FOLDER START ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_new_folder_"))
@@ -958,7 +1048,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, _ = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for new folder: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -983,6 +1078,11 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             uid = message.from_user.id
             user_state = user_input.get(uid, {})
             server_id = user_state.get('server_id')
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await message.answer("❌ Server not found.")
+                return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
                 await message.answer("❌ No active SSH session.")
@@ -1013,7 +1113,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for rename: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -1039,6 +1144,11 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             uid = message.from_user.id
             user_state = user_input.get(uid, {})
             server_id = user_state.get('server_id')
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await message.answer("❌ Server not found.")
+                return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
                 await message.answer("❌ No active SSH session.")
@@ -1077,7 +1187,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for view: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -1090,12 +1205,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             current_path = user_state['current_path']
             file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            from main import get_ssh_session, get_server_by_id  # Delayed import
-            server = await get_server_by_id(server_id)
-            if not server:
-                logger.error(f"Server {server_id} not found")
-                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button(f"server_{server_id}"))
-                return
+            from main import get_ssh_session, get_server_by_id
             ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
             sftp = ssh.open_sftp()
             file_stat = sftp.stat(file_path)
@@ -1136,7 +1246,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             _, server_id, file_name = parse_callback_data(callback.data)
             if not server_id:
                 logger.error(f"Invalid callback data for details: {callback.data}")
-                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("server_menu"))
+                await callback.message.edit_text("❌ Invalid server ID.", reply_markup=back_button("start"))
+                return
+            server = await get_server_by_id(server_id)
+            if not server:
+                logger.error(f"Server {server_id} not found in database")
+                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button("start"))
                 return
             if server_id not in active_sessions:
                 logger.error(f"No active SSH session for server {server_id}")
@@ -1149,27 +1264,31 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             current_path = user_state['current_path']
             file_path = sanitize_path(f"{current_path.rstrip('/')}/{file_name}")
-            from main import get_ssh_session, get_server_by_id  # Delayed import
-            server = await get_server_by_id(server_id)
-            if not server:
-                logger.error(f"Server {server_id} not found")
-                await callback.message.edit_text("❌ Server not found.", reply_markup=back_button(f"server_{server_id}"))
-                return
+            from main import get_ssh_session, get_server_by_id
             ssh = get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
-            command = f'ls -l "{file_path}"'
+            command = f'ls -l --time-style=+"%Y-%m-%d %H:%M" "{file_path}"'
             stdout_data, stderr_data = execute_ssh_command(ssh, command)
             if stderr_data:
-                await callback.message.edit_text(f"❌ Error: {html.escape(stderr_data)}", reply_markup=back_button(f"fm_refresh_{server_id}"))
+                await callback.message.edit_text(f"❌ Error getting file details: {html.escape(stderr_data)}", reply_markup=back_button(f"fm_refresh_{server_id}"))
                 return
-            file_info = parse_ls_output(stdout_data)[0]
-            text = f"📄 File Details: {html.escape(file_name)}\n"
-            text += f"Path: {html.escape(current_path)}\n"
-            text += f"Size: {format_size(file_info['size'])}\n"
-            text += f"Modified: {html.escape(file_info['mtime'])}\n"
-            text += f"Permissions: {html.escape(file_info['perms'])}\n"
-            text += f"Owner: {html.escape(file_info['owner'])}\n"
-            text += f"Group: {html.escape(file_info['group'])}"
+            files = parse_ls_output(stdout_data)
+            if not files:
+                await callback.message.edit_text("❌ File not found.", reply_markup=back_button(f"fm_refresh_{server_id}"))
+                return
+            file_info = files[0]
+            text = (
+                f"ℹ️ File: {html.escape(file_name)}\n"
+                f"Path: {html.escape(current_path)}\n"
+                f"Type: {'Directory' if file_info['is_dir'] else 'File'}\n"
+                f"Size: {format_size(file_info['size'])}\n"
+                f"Modified: {file_info['mtime']}\n"
+                f"Permissions: {file_info['perms']}\n"
+                f"Owner: {file_info['owner']}\n"
+                f"Group: {file_info['group']}"
+            )
             await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_button(f"fm_refresh_{server_id}"))
         except Exception as e:
             logger.error(f"File details error for server {server_id}, user {callback.from_user.id}: {e}")
-            await callback.message.edit_text(f"❌ Error fetching details: {html.escape(str(e))}", reply_markup=back_button(f"fm_refresh_{server_id}"))
+            await callback.message.edit_text(f"❌ Error getting file details: {html.escape(str(e))}", reply_markup=back_button(f"fm_refresh_{server_id}"))
+
+    # --- SEARCH FILES START ---
