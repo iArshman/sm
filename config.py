@@ -1,4 +1,24 @@
-MONGO_URI = "mongodb+srv://irexanon:xUf7PCf9cvMHy8g6@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB"
-BOT_TOKEN = "8167520002:AAEHfTsi8SBJQU2V8mOVI15MG2X8fvKQZoU"
-ADMIN_IDS = [7405203657]  # Your Telegram user ID
-SSH_TIMEOUT = 5  # seconds
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Bot configuration
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required")
+
+# MongoDB configuration
+MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
+
+# SSH configuration
+SSH_TIMEOUT = int(os.getenv('SSH_TIMEOUT', '15'))
+MAX_CONNECTIONS = int(os.getenv('MAX_CONNECTIONS', '10'))
+
+# File manager configuration
+MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', '50')) * 1024 * 1024  # 50MB default
+ALLOWED_EXTENSIONS = os.getenv('ALLOWED_EXTENSIONS', '').split(',') if os.getenv('ALLOWED_EXTENSIONS') else []
+
+# Logging configuration
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
