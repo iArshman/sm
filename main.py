@@ -565,7 +565,25 @@ async def server_info(callback: types.CallbackQuery):
 
 # --- BOT MANAGER PLACEHOLDER ---
 
-
+@dp.callback_query_handler(lambda c: c.data.startswith("bot_manager_"))
+async def bot_manager(callback: types.CallbackQuery):
+    """Bot manager placeholder"""
+    server_id = callback.data.split('_')[2]
+    
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"server_{server_id}"))
+    
+    await callback.message.edit_text(
+        "🤖 <b>Bot Manager</b>\n\n"
+        "This feature is coming soon!\n\n"
+        "Future capabilities:\n"
+        "• Deploy and manage bots\n"
+        "• Monitor bot status\n"
+        "• View logs and metrics\n"
+        "• Auto-restart functionality",
+        parse_mode='HTML',
+        reply_markup=kb
+    )
 
 # --- SERVER SETTINGS ---
 
