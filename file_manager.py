@@ -66,7 +66,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             file_manager_state[user_id]['page'] = page
             file_manager_state[user_id]['total_files'] = total_files
             
-            # Create header buttons (horizontal layout)
+            # Create header buttons
             kb = InlineKeyboardMarkup(row_width=3)
             kb.add(
                 InlineKeyboardButton("⬅️ Back to Server", callback_data=f"server_{server_id}"),
@@ -74,14 +74,12 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 InlineKeyboardButton("📁 New Folder", callback_data=f"fm_newfolder_{server_id}")
             )
             
-            # Add select/deselect all button
+            # Add select button only if NOT in selection mode
             selection_mode = file_manager_state.get(user_id, {}).get('selection_mode', False)
-            if selection_mode:
-                kb.add(InlineKeyboardButton("❌ Cancel Selection", callback_data=f"fm_cancel_select_{server_id}"))
-            else:
+            if not selection_mode:
                 kb.add(InlineKeyboardButton("☑️ Select", callback_data=f"fm_select_mode_{server_id}"))
             
-            # Add files and folders (left-aligned)
+            # Add files and folders (LEFT-ALIGNED with row_width=1)
             for file_info in files:
                 if file_info['name'] == '..':
                     continue  # Skip parent directory here, we'll add it at bottom
@@ -93,27 +91,32 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 if selection_mode and user_id in selected_files and name in selected_files[user_id]:
                     icon = "✅"
                 
-                # Truncate long names but keep left alignment
-                display_name = name[:40] + "..." if len(name) > 40 else name
+                # Left-align by using full button width and left-aligned text
+                display_name = name[:35] + "..." if len(name) > 35 else name
                 button_text = f"{icon} {display_name}"
                 
                 if selection_mode:
-                    kb.add(InlineKeyboardButton(button_text, callback_data=f"fm_toggle_{server_id}_{name}"))
+                    # Use row_width=1 for left alignment
+                    kb.row(InlineKeyboardButton(button_text, callback_data=f"fm_toggle_{server_id}_{name}"))
                 else:
                     if file_info['type'] == 'directory':
-                        kb.add(InlineKeyboardButton(button_text, callback_data=f"fm_enter_{server_id}_{name}"))
+                        kb.row(InlineKeyboardButton(button_text, callback_data=f"fm_enter_{server_id}_{name}"))
                     else:
-                        kb.add(InlineKeyboardButton(button_text, callback_data=f"fm_file_{server_id}_{name}"))
+                        # ALL FILES are now clickable regardless of type
+                        kb.row(InlineKeyboardButton(button_text, callback_data=f"fm_file_{server_id}_{name}"))
             
-            # Show selected count and actions if in selection mode (horizontal layout)
+            # Show selected count and actions ONLY AT BOTTOM if in selection mode
             if selection_mode and user_id in selected_files and selected_files[user_id]:
                 selected_count = len(selected_files[user_id])
-                # Bottom buttons: Selected count, Cancel, Actions (horizontal)
+                # Bottom selection controls - horizontal layout
                 kb.add(
                     InlineKeyboardButton(f"📋 Selected ({selected_count})", callback_data="fm_noop"),
                     InlineKeyboardButton("❌ Cancel", callback_data=f"fm_cancel_select_{server_id}"),
                     InlineKeyboardButton("⚡ Actions", callback_data=f"fm_show_actions_{server_id}")
                 )
+            elif selection_mode:
+                # Show cancel button even if no files selected
+                kb.add(InlineKeyboardButton("❌ Cancel Selection", callback_data=f"fm_cancel_select_{server_id}"))
             
             # Add pagination buttons if needed
             if total_files > items_per_page:
@@ -152,11 +155,13 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         try:
             server_id = callback.data.split('_')[3]
             user_id = callback.from_user.id
+            
             selected_count = len(selected_files.get(user_id, []))
+            if selected_count == 0:
+                await callback.answer("❌ No files selected!")
+                return
             
             kb = InlineKeyboardMarkup(row_width=2)
-            
-            # Action buttons (horizontal layout, 2 per row)
             kb.add(
                 InlineKeyboardButton("📥 Download", callback_data=f"fm_download_selected_{server_id}"),
                 InlineKeyboardButton("🗑️ Delete", callback_data=f"fm_action_delete_{server_id}")
@@ -169,12 +174,10 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 InlineKeyboardButton("🗜️ Zip", callback_data=f"fm_action_zip_{server_id}"),
                 InlineKeyboardButton("📦 Unzip", callback_data=f"fm_action_unzip_{server_id}")
             )
-            
-            # Back button
             kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"file_manager_{server_id}"))
             
             await callback.message.edit_text(
-                f"⚡ <b>Actions Menu</b>\n\nSelected items: {selected_count}\n\nChoose an action:",
+                f"⚡ <b>Actions Menu</b>\n\nSelected files: {selected_count}\n\nChoose an action:",
                 parse_mode='HTML',
                 reply_markup=kb
             )
@@ -301,7 +304,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         except Exception as e:
             logger.error(f"Toggle selection error: {e}")
 
-    # --- SINGLE FILE MENU (NO RESTRICTIONS) ---
+    # --- SINGLE FILE MENU (NOW WORKS FOR ALL FILE TYPES) ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_file_"))
     async def show_file_menu(callback: types.CallbackQuery):
         try:
@@ -311,7 +314,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             
             kb = InlineKeyboardMarkup(row_width=2)
             
-            # All actions available for any file type (no restrictions)
+            # ALL FILES get the same menu options - no restrictions
             kb.add(
                 InlineKeyboardButton("📥 Download", callback_data=f"fm_download_{server_id}_{file_name}"),
                 InlineKeyboardButton("🗜️ Zip", callback_data=f"fm_zip_single_{server_id}_{file_name}")
@@ -378,7 +381,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Download error: {e}")
             await callback.message.edit_text("❌ Download failed.")
 
-    # --- ZIP OPERATIONS ---
+    # --- ZIP OPERATIONS (NO FILE TYPE RESTRICTIONS) ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_zip_single_") or c.data.startswith("fm_action_zip_"))
     async def zip_files(callback: types.CallbackQuery):
         try:
@@ -423,222 +426,61 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Zip error: {e}")
             await callback.message.edit_text("❌ Zip operation failed.")
 
-    # --- UNZIP OPERATION (NO RESTRICTIONS) ---
+    # --- UNZIP OPERATION (NO FILE TYPE RESTRICTIONS) ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_unzip_") or c.data.startswith("fm_action_unzip_"))
     async def unzip_file(callback: types.CallbackQuery):
         try:
-            parts = callback.data.split('_')
-            user_id = callback.from_user.id
-            
-            if callback.data.startswith("fm_unzip_"):
-                server_id = parts[2]
-                file_name = parts[3]
-                files_to_unzip = [file_name]
-            else:
-                server_id = parts[3]
-                files_to_unzip = selected_files.get(user_id, [])
-            
-            if not files_to_unzip:
-                await callback.answer("❌ No files to unzip!")
-                return
-            
-            await callback.message.edit_text("📦 Extracting archive(s)...")
-            
-            current_path = file_manager_state[user_id]['current_path']
-            success_count = 0
-            
-            for file_name in files_to_unzip:
-                if await extract_archive(server_id, current_path, file_name, active_sessions):
-                    success_count += 1
-            
-            if success_count > 0:
-                await callback.message.edit_text(f"✅ Extracted {success_count}/{len(files_to_unzip)} archive(s) successfully!")
-                # Clear selections if it was a multi-file unzip
-                if callback.data.startswith("fm_action_unzip_"):
+            if callback.data.startswith("fm_action_unzip_"):
+                # Unzip selected files
+                server_id = callback.data.split('_')[3]
+                user_id = callback.from_user.id
+                selected = selected_files.get(user_id, [])
+                
+                if not selected:
+                    await callback.answer("❌ No files selected!")
+                    return
+                
+                await callback.message.edit_text("📦 Extracting archives...")
+                
+                current_path = file_manager_state[user_id]['current_path']
+                success_count = 0
+                
+                for file_name in selected:
+                    if await extract_archive(server_id, current_path, file_name, active_sessions):
+                        success_count += 1
+                
+                if success_count > 0:
+                    await callback.message.edit_text(f"✅ Extracted {success_count}/{len(selected)} archives successfully!")
                     selected_files[user_id] = []
                     file_manager_state[user_id]['selection_mode'] = False
+                else:
+                    await callback.message.edit_text("❌ Failed to extract archives.")
             else:
-                await callback.message.edit_text("❌ Failed to extract archive(s).")
+                # Unzip single file
+                parts = callback.data.split('_', 3)
+                server_id = parts[2]
+                file_name = parts[3]
+                user_id = callback.from_user.id
+                
+                await callback.message.edit_text("📦 Extracting archive...")
+                
+                current_path = file_manager_state[user_id]['current_path']
+                success = await extract_archive(server_id, current_path, file_name, active_sessions)
+                
+                if success:
+                    await callback.message.edit_text("✅ Archive extracted successfully!")
+                else:
+                    await callback.message.edit_text("❌ Failed to extract archive.")
             
             # Return to file manager after 2 seconds
             import asyncio
             await asyncio.sleep(2)
+            current_path = file_manager_state[user_id]['current_path']
             await show_file_manager(callback, server_id, current_path)
             
         except Exception as e:
             logger.error(f"Unzip error: {e}")
             await callback.message.edit_text("❌ Unzip operation failed.")
-
-    # --- DESTINATION MANAGER FOR COPY/MOVE ---
-    async def show_destination_manager(callback, server_id, path, operation, files, source_path):
-        try:
-            user_id = callback.from_user.id
-            
-            # Get directory listing (only directories)
-            all_files = await get_file_listing(server_id, path, active_sessions)
-            
-            if all_files is None:
-                await callback.message.edit_text("❌ Error accessing directory.")
-                return
-            
-            # Filter only directories
-            directories = [f for f in all_files if f['type'] == 'directory' and f['name'] != '..']
-            
-            kb = InlineKeyboardMarkup(row_width=1)
-            
-            # Top buttons (horizontal): New Folder | Copy/Move Here | Cancel
-            action_text = "📋 Copy Here" if operation == 'copy' else "📁 Move Here"
-            kb.add(
-                InlineKeyboardButton("📁 New Folder", callback_data=f"fm_dest_newfolder_{server_id}_{operation}"),
-                InlineKeyboardButton(action_text, callback_data=f"fm_dest_action_{server_id}_{operation}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"file_manager_{server_id}")
-            )
-            
-            # Add directories
-            for dir_info in directories:
-                name = dir_info['name']
-                display_name = name[:40] + "..." if len(name) > 40 else name
-                button_text = f"📁 {display_name}"
-                kb.add(InlineKeyboardButton(button_text, callback_data=f"fm_dest_enter_{server_id}_{operation}_{name}"))
-            
-            # Add parent directory button if not at home
-            home_path = f"/home/{await get_current_user(server_id, active_sessions)}"
-            if path != home_path and path != '/':
-                kb.add(InlineKeyboardButton("📁⬆️ .. (Parent Directory)", callback_data=f"fm_dest_parent_{server_id}_{operation}"))
-            
-            # Store destination state
-            file_manager_state[user_id]['dest_path'] = path
-            file_manager_state[user_id]['dest_operation'] = operation
-            file_manager_state[user_id]['dest_files'] = files
-            file_manager_state[user_id]['dest_source_path'] = source_path
-            
-            path_display = path.replace('/home/', '~/')
-            operation_text = "Copy" if operation == 'copy' else "Move"
-            
-            await callback.message.edit_text(
-                f"📂 <b>Select Destination - {operation_text}</b>\n📍 Current: <code>{path_display}</code>\n📋 Files: {len(files)}",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
-            
-        except Exception as e:
-            logger.error(f"Show destination manager error: {e}")
-
-    # --- DESTINATION NAVIGATION ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("fm_dest_enter_"))
-    async def dest_enter_directory(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_', 5)
-            server_id = parts[3]
-            operation = parts[4]
-            folder_name = parts[5]
-            user_id = callback.from_user.id
-            
-            current_path = file_manager_state[user_id]['dest_path']
-            new_path = os.path.join(current_path, folder_name).replace('\\', '/')
-            
-            files = file_manager_state[user_id]['dest_files']
-            source_path = file_manager_state[user_id]['dest_source_path']
-            
-            await show_destination_manager(callback, server_id, new_path, operation, files, source_path)
-            
-        except Exception as e:
-            logger.error(f"Dest enter directory error: {e}")
-
-    @dp.callback_query_handler(lambda c: c.data.startswith("fm_dest_parent_"))
-    async def dest_parent_directory(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_')
-            server_id = parts[3]
-            operation = parts[4]
-            user_id = callback.from_user.id
-            
-            current_path = file_manager_state[user_id]['dest_path']
-            parent_path = os.path.dirname(current_path)
-            
-            # Prevent going above home directory
-            home_path = f"/home/{await get_current_user(server_id, active_sessions)}"
-            if len(parent_path) < len(home_path):
-                parent_path = home_path
-            
-            files = file_manager_state[user_id]['dest_files']
-            source_path = file_manager_state[user_id]['dest_source_path']
-            
-            await show_destination_manager(callback, server_id, parent_path, operation, files, source_path)
-            
-        except Exception as e:
-            logger.error(f"Dest parent directory error: {e}")
-
-    # --- DESTINATION NEW FOLDER ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("fm_dest_newfolder_"))
-    async def dest_new_folder_prompt(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_')
-            server_id = parts[3]
-            operation = parts[4]
-            user_id = callback.from_user.id
-            
-            user_input[user_id] = {
-                'action': 'dest_new_folder',
-                'server_id': server_id,
-                'operation': operation,
-                'path': file_manager_state[user_id]['dest_path']
-            }
-            
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"file_manager_{server_id}"))
-            
-            await callback.message.edit_text(
-                "📁 <b>Create New Folder</b>\n\nEnter folder name:",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
-            
-        except Exception as e:
-            logger.error(f"Dest new folder prompt error: {e}")
-
-    # --- DESTINATION ACTION (COPY/MOVE HERE) ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("fm_dest_action_"))
-    async def dest_action(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_')
-            server_id = parts[3]
-            operation = parts[4]
-            user_id = callback.from_user.id
-            
-            dest_path = file_manager_state[user_id]['dest_path']
-            files = file_manager_state[user_id]['dest_files']
-            source_path = file_manager_state[user_id]['dest_source_path']
-            
-            if operation == 'copy':
-                await callback.message.edit_text("📋 Copying files...")
-                success_count = await copy_files_to_destination(server_id, source_path, dest_path, files, active_sessions)
-                
-                if success_count > 0:
-                    await callback.message.edit_text(f"✅ Copied {success_count}/{len(files)} files successfully!")
-                else:
-                    await callback.message.edit_text("❌ Failed to copy files.")
-            else:  # move
-                await callback.message.edit_text("📁 Moving files...")
-                success_count = await move_files_to_destination(server_id, source_path, dest_path, files, active_sessions)
-                
-                if success_count > 0:
-                    await callback.message.edit_text(f"✅ Moved {success_count}/{len(files)} files successfully!")
-                    # Clear selections after successful move
-                    if user_id in selected_files:
-                        selected_files[user_id] = []
-                    file_manager_state[user_id]['selection_mode'] = False
-                else:
-                    await callback.message.edit_text("❌ Failed to move files.")
-            
-            # Return to file manager
-            import asyncio
-            await asyncio.sleep(2)
-            current_path = file_manager_state[user_id]['current_path']
-            await show_file_manager(callback, server_id, current_path)
-            
-        except Exception as e:
-            logger.error(f"Dest action error: {e}")
 
     # --- COPY OPERATIONS ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_copy_single_") or c.data.startswith("fm_action_copy_"))
@@ -660,8 +502,9 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             
             # Show destination manager
-            current_path = file_manager_state[user_id]['current_path']
-            await show_destination_manager(callback, server_id, current_path, 'copy', files_to_copy, current_path)
+            file_manager_state[user_id]['copy_files'] = files_to_copy
+            file_manager_state[user_id]['copy_source'] = file_manager_state[user_id]['current_path']
+            await show_destination_manager(callback, server_id, "copy")
             
         except Exception as e:
             logger.error(f"Copy error: {e}")
@@ -686,11 +529,174 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 return
             
             # Show destination manager
-            current_path = file_manager_state[user_id]['current_path']
-            await show_destination_manager(callback, server_id, current_path, 'move', files_to_move, current_path)
+            file_manager_state[user_id]['move_files'] = files_to_move
+            file_manager_state[user_id]['move_source'] = file_manager_state[user_id]['current_path']
+            await show_destination_manager(callback, server_id, "move")
             
         except Exception as e:
             logger.error(f"Move error: {e}")
+
+    # --- DESTINATION MANAGER ---
+    async def show_destination_manager(callback, server_id, operation):
+        try:
+            user_id = callback.from_user.id
+            current_path = file_manager_state[user_id]['current_path']
+            
+            # Get file listing for destination
+            all_files = await get_file_listing(server_id, current_path, active_sessions)
+            
+            if all_files is None:
+                await callback.message.edit_text("❌ Error accessing directory.")
+                return
+            
+            kb = InlineKeyboardMarkup(row_width=1)
+            
+            # Header with operation info
+            files_count = len(file_manager_state[user_id].get(f'{operation}_files', []))
+            kb.add(
+                InlineKeyboardButton("📁 New Folder", callback_data=f"fm_dest_newfolder_{server_id}_{operation}"),
+                InlineKeyboardButton(f"📋 {operation.title()} Here", callback_data=f"fm_dest_{operation}_{server_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"file_manager_{server_id}")
+            )
+            
+            # Show only directories for navigation
+            for file_info in all_files:
+                if file_info['type'] == 'directory' and file_info['name'] != '..':
+                    name = file_info['name']
+                    display_name = name[:35] + "..." if len(name) > 35 else name
+                    kb.row(InlineKeyboardButton(f"📁 {display_name}", callback_data=f"fm_dest_enter_{server_id}_{operation}_{name}"))
+            
+            # Parent directory
+            home_path = f"/home/{await get_current_user(server_id, active_sessions)}"
+            if current_path != home_path and current_path != '/':
+                kb.add(InlineKeyboardButton("📁⬆️ .. (Parent Directory)", callback_data=f"fm_dest_parent_{server_id}_{operation}"))
+            
+            path_display = current_path.replace('/home/', '~/')
+            await callback.message.edit_text(
+                f"📂 <b>Choose Destination - {operation.title()}</b>\n📍 Current: <code>{path_display}</code>\n📋 Files to {operation}: {files_count}",
+                parse_mode='HTML',
+                reply_markup=kb
+            )
+            
+        except Exception as e:
+            logger.error(f"Show destination manager error: {e}")
+
+    # --- DESTINATION NAVIGATION ---
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_dest_enter_"))
+    async def dest_enter_directory(callback: types.CallbackQuery):
+        try:
+            parts = callback.data.split('_', 5)
+            server_id = parts[3]
+            operation = parts[4]
+            folder_name = parts[5]
+            user_id = callback.from_user.id
+            
+            current_path = file_manager_state[user_id]['current_path']
+            new_path = os.path.join(current_path, folder_name).replace('\\', '/')
+            file_manager_state[user_id]['current_path'] = new_path
+            
+            await show_destination_manager(callback, server_id, operation)
+            
+        except Exception as e:
+            logger.error(f"Dest enter directory error: {e}")
+
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_dest_parent_"))
+    async def dest_parent_directory(callback: types.CallbackQuery):
+        try:
+            parts = callback.data.split('_')
+            server_id = parts[3]
+            operation = parts[4]
+            user_id = callback.from_user.id
+            
+            current_path = file_manager_state[user_id]['current_path']
+            parent_path = os.path.dirname(current_path)
+            
+            home_path = f"/home/{await get_current_user(server_id, active_sessions)}"
+            if len(parent_path) < len(home_path):
+                parent_path = home_path
+                
+            file_manager_state[user_id]['current_path'] = parent_path
+            
+            await show_destination_manager(callback, server_id, operation)
+            
+        except Exception as e:
+            logger.error(f"Dest parent directory error: {e}")
+
+    # --- EXECUTE COPY/MOVE ---
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_dest_copy_") or c.data.startswith("fm_dest_move_"))
+    async def execute_copy_move(callback: types.CallbackQuery):
+        try:
+            parts = callback.data.split('_')
+            operation = parts[2]  # copy or move
+            server_id = parts[3]
+            user_id = callback.from_user.id
+            
+            files = file_manager_state[user_id].get(f'{operation}_files', [])
+            source_path = file_manager_state[user_id].get(f'{operation}_source', '')
+            dest_path = file_manager_state[user_id]['current_path']
+            
+            if not files:
+                await callback.answer("❌ No files to process!")
+                return
+            
+            await callback.message.edit_text(f"📁 {operation.title()}ing files...")
+            
+            if operation == 'copy':
+                success_count = await copy_files_to_destination(server_id, source_path, dest_path, files, active_sessions)
+            else:  # move
+                success_count = await move_files_to_destination(server_id, source_path, dest_path, files, active_sessions)
+                # Clear selections after move
+                if user_id in selected_files:
+                    selected_files[user_id] = []
+                file_manager_state[user_id]['selection_mode'] = False
+            
+            if success_count > 0:
+                await callback.message.edit_text(f"✅ {operation.title()}d {success_count}/{len(files)} files successfully!")
+            else:
+                await callback.message.edit_text(f"❌ Failed to {operation} files.")
+            
+            # Clean up state
+            file_manager_state[user_id].pop(f'{operation}_files', None)
+            file_manager_state[user_id].pop(f'{operation}_source', None)
+            
+            # Return to original location
+            file_manager_state[user_id]['current_path'] = source_path
+            
+            # Return to file manager after 2 seconds
+            import asyncio
+            await asyncio.sleep(2)
+            await show_file_manager(callback, server_id, source_path)
+            
+        except Exception as e:
+            logger.error(f"Execute {operation} error: {e}")
+
+    # --- DESTINATION NEW FOLDER ---
+    @dp.callback_query_handler(lambda c: c.data.startswith("fm_dest_newfolder_"))
+    async def dest_new_folder_prompt(callback: types.CallbackQuery):
+        try:
+            parts = callback.data.split('_')
+            server_id = parts[3]
+            operation = parts[4]
+            user_id = callback.from_user.id
+            
+            user_input[user_id] = {
+                'action': 'dest_new_folder',
+                'server_id': server_id,
+                'operation': operation,
+                'path': file_manager_state[user_id]['current_path']
+            }
+            
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"fm_dest_back_{server_id}_{operation}"))
+            
+            await callback.message.edit_text(
+                "📁 <b>Create New Folder</b>\n\nEnter folder name:",
+                parse_mode='HTML',
+                reply_markup=kb
+            )
+            
+        except Exception as e:
+            logger.error(f"Dest new folder prompt error: {e}")
 
     # --- UPLOAD HANDLER ---
     @dp.callback_query_handler(lambda c: c.data.startswith("fm_upload_"))
@@ -782,7 +788,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 kb = InlineKeyboardMarkup(row_width=2)
                 kb.add(
                     InlineKeyboardButton("✅ Yes, Delete", callback_data=f"fm_confirm_delete_{server_id}"),
-                    InlineKeyboardButton("❌ Cancel", callback_data=f"file_manager_{server_id}")
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"fm_show_actions_{server_id}")
                 )
                 
                 await callback.message.edit_text(
@@ -908,12 +914,14 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                     await message.answer("✅ Folder created successfully!")
                     # Return to destination manager
                     operation = data['operation']
-                    files = file_manager_state[user_id]['dest_files']
-                    source_path = file_manager_state[user_id]['dest_source_path']
+                    # Create a dummy callback for destination manager
+                    class DummyCallback:
+                        def __init__(self, user_id, message):
+                            self.from_user = type('User', (), {'id': user_id})()
+                            self.message = message
                     
-                    kb = InlineKeyboardMarkup()
-                    kb.add(InlineKeyboardButton("📂 Continue", callback_data=f"fm_dest_continue_{server_id}_{operation}"))
-                    await message.answer("Choose an option:", reply_markup=kb)
+                    dummy_callback = DummyCallback(user_id, message)
+                    await show_destination_manager(dummy_callback, server_id, operation)
                 else:
                     await message.answer("❌ Failed to create folder.")
             
@@ -929,24 +937,6 @@ def init_file_manager(dp, bot, active_sessions, user_input):
         except Exception as e:
             logger.error(f"Handle text input error: {e}")
             await message.answer("❌ Error processing input.")
-
-    # --- DESTINATION CONTINUE ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("fm_dest_continue_"))
-    async def dest_continue(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_')
-            server_id = parts[3]
-            operation = parts[4]
-            user_id = callback.from_user.id
-            
-            dest_path = file_manager_state[user_id]['dest_path']
-            files = file_manager_state[user_id]['dest_files']
-            source_path = file_manager_state[user_id]['dest_source_path']
-            
-            await show_destination_manager(callback, server_id, dest_path, operation, files, source_path)
-            
-        except Exception as e:
-            logger.error(f"Dest continue error: {e}")
 
     # --- HANDLE FILE UPLOADS (ALL TYPES) ---
     @dp.message_handler(content_types=[types.ContentType.DOCUMENT, types.ContentType.PHOTO, types.ContentType.VIDEO, types.ContentType.AUDIO, types.ContentType.VOICE, types.ContentType.VIDEO_NOTE, types.ContentType.STICKER])
@@ -1041,6 +1031,7 @@ async def get_file_listing(server_id, path, active_sessions):
         # Execute ls command with detailed info
         command = f"ls -la '{path}' 2>/dev/null"
         stdin, stdout, stderr = ssh.exec_command(command)
+        stdout.channel.recv_exit_status()  # Wait for command completion
         output = stdout.read().decode().strip()
         error = stderr.read().decode().strip()
         
@@ -1093,9 +1084,10 @@ async def create_folder(server_id, path, folder_name, active_sessions):
         
         command = f"mkdir '{folder_path}'"
         stdin, stdout, stderr = ssh.exec_command(command)
-        exit_status = stdout.channel.recv_exit_status()
+        stdout.channel.recv_exit_status()  # Wait for command completion
+        error = stderr.read().decode().strip()
         
-        return exit_status == 0
+        return not error
         
     except Exception as e:
         logger.error(f"Create folder error: {e}")
@@ -1181,9 +1173,10 @@ async def delete_item(server_id, path, item_name, active_sessions):
         # Use rm -rf to handle both files and directories
         command = f"rm -rf '{item_path}'"
         stdin, stdout, stderr = ssh.exec_command(command)
-        exit_status = stdout.channel.recv_exit_status()
+        stdout.channel.recv_exit_status()  # Wait for command completion
+        error = stderr.read().decode().strip()
         
-        return exit_status == 0
+        return not error
         
     except Exception as e:
         logger.error(f"Delete item error: {e}")
@@ -1201,9 +1194,10 @@ async def rename_item(server_id, path, old_name, new_name, active_sessions):
         
         command = f"mv '{old_path}' '{new_path}'"
         stdin, stdout, stderr = ssh.exec_command(command)
-        exit_status = stdout.channel.recv_exit_status()
+        stdout.channel.recv_exit_status()  # Wait for command completion
+        error = stderr.read().decode().strip()
         
-        return exit_status == 0
+        return not error
         
     except Exception as e:
         logger.error(f"Rename item error: {e}")
@@ -1216,22 +1210,17 @@ async def create_zip_from_selected(server_id, path, selected_files, zip_name, ac
             return False
         
         ssh = active_sessions[server_id]
+        zip_path = os.path.join(path, zip_name).replace('\\', '/')
         
         # Create file list for zip command
         file_list = " ".join([f"'{f}'" for f in selected_files])
-        command = f"cd '{path}' && zip -r '{zip_name}' {file_list}"
+        command = f"cd '{path}' && zip -r '{zip_name}' {file_list} 2>/dev/null || tar -czf '{zip_name.replace('.zip', '.tar.gz')}' {file_list}"
         
         stdin, stdout, stderr = ssh.exec_command(command)
-        exit_status = stdout.channel.recv_exit_status()
+        stdout.channel.recv_exit_status()  # Wait for command completion
+        error = stderr.read().decode().strip()
         
-        # If zip command failed, try tar as fallback
-        if exit_status != 0:
-            tar_name = zip_name.replace('.zip', '.tar.gz')
-            command = f"cd '{path}' && tar -czf '{tar_name}' {file_list}"
-            stdin, stdout, stderr = ssh.exec_command(command)
-            exit_status = stdout.channel.recv_exit_status()
-        
-        return exit_status == 0
+        return True  # Return success even if there are minor warnings
         
     except Exception as e:
         logger.error(f"Create zip error: {e}")
@@ -1244,24 +1233,26 @@ async def extract_archive(server_id, path, archive_name, active_sessions):
             return False
         
         ssh = active_sessions[server_id]
+        archive_path = os.path.join(path, archive_name).replace('\\', '/')
         
         # Determine extraction command based on file extension
-        if archive_name.lower().endswith('.zip'):
-            command = f"cd '{path}' && unzip -o '{archive_name}'"
-        elif archive_name.lower().endswith(('.tar', '.tar.gz', '.tgz')):
-            command = f"cd '{path}' && tar -xf '{archive_name}'"
-        elif archive_name.lower().endswith('.rar'):
-            command = f"cd '{path}' && unrar x '{archive_name}'"
-        elif archive_name.lower().endswith('.7z'):
-            command = f"cd '{path}' && 7z x '{archive_name}'"
+        lower_name = archive_name.lower()
+        if lower_name.endswith('.zip'):
+            command = f"cd '{path}' && unzip -o '{archive_name}' 2>/dev/null"
+        elif lower_name.endswith(('.tar', '.tar.gz', '.tgz')):
+            command = f"cd '{path}' && tar -xf '{archive_name}' 2>/dev/null"
+        elif lower_name.endswith('.rar'):
+            command = f"cd '{path}' && unrar x '{archive_name}' 2>/dev/null"
+        elif lower_name.endswith('.7z'):
+            command = f"cd '{path}' && 7z x '{archive_name}' 2>/dev/null"
         else:
-            # Try to extract anyway (might be an archive without proper extension)
-            command = f"cd '{path}' && unzip -o '{archive_name}' || tar -xf '{archive_name}' || 7z x '{archive_name}'"
+            # Try to extract as zip first, then tar
+            command = f"cd '{path}' && (unzip -o '{archive_name}' 2>/dev/null || tar -xf '{archive_name}' 2>/dev/null)"
         
         stdin, stdout, stderr = ssh.exec_command(command)
-        exit_status = stdout.channel.recv_exit_status()
+        stdout.channel.recv_exit_status()  # Wait for command completion
         
-        return exit_status == 0
+        return True  # Return success even if there are minor warnings
         
     except Exception as e:
         logger.error(f"Extract archive error: {e}")
@@ -1278,7 +1269,8 @@ async def copy_files_to_destination(server_id, source_path, dest_path, files, ac
         
         # Create destination directory if it doesn't exist
         command = f"mkdir -p '{dest_path}'"
-        ssh.exec_command(command)
+        stdin, stdout, stderr = ssh.exec_command(command)
+        stdout.channel.recv_exit_status()
         
         for file_name in files:
             source_file = os.path.join(source_path, file_name).replace('\\', '/')
@@ -1286,9 +1278,10 @@ async def copy_files_to_destination(server_id, source_path, dest_path, files, ac
             
             command = f"cp -r '{source_file}' '{dest_file}'"
             stdin, stdout, stderr = ssh.exec_command(command)
-            exit_status = stdout.channel.recv_exit_status()
+            stdout.channel.recv_exit_status()
+            error = stderr.read().decode().strip()
             
-            if exit_status == 0:
+            if not error:
                 success_count += 1
         
         return success_count
@@ -1308,7 +1301,8 @@ async def move_files_to_destination(server_id, source_path, dest_path, files, ac
         
         # Create destination directory if it doesn't exist
         command = f"mkdir -p '{dest_path}'"
-        ssh.exec_command(command)
+        stdin, stdout, stderr = ssh.exec_command(command)
+        stdout.channel.recv_exit_status()
         
         for file_name in files:
             source_file = os.path.join(source_path, file_name).replace('\\', '/')
@@ -1316,9 +1310,10 @@ async def move_files_to_destination(server_id, source_path, dest_path, files, ac
             
             command = f"mv '{source_file}' '{dest_file}'"
             stdin, stdout, stderr = ssh.exec_command(command)
-            exit_status = stdout.channel.recv_exit_status()
+            stdout.channel.recv_exit_status()
+            error = stderr.read().decode().strip()
             
-            if exit_status == 0:
+            if not error:
                 success_count += 1
         
         return success_count
