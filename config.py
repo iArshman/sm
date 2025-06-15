@@ -1,53 +1,37 @@
 import os
 import sys
 from pathlib import Path
-from dotenv import load_dotenv
 
-# Get the project root directory (parent of bot directory)
-project_root = Path(__file__).parent.parent
-env_path = project_root / '.env'
+# Hardcoded credentials
+BOT_TOKEN = "8167520002:AAEHfTsi8SBJQU2V8mOVI15MG2X8fvKQZoU"
+MONGO_URI = "mongodb+srv://irexanon:xUf7PCf9cvMHy8g6@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB"
 
-# Load environment variables from .env file
-if env_path.exists():
-    load_dotenv(env_path)
-    print(f"✅ Loaded environment variables from: {env_path}")
-else:
-    # Try loading from current directory
-    load_dotenv()
-    print("⚠️ Loading environment variables from current directory")
-
-# Bot configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+# Bot token check
 if not BOT_TOKEN:
-    print("❌ BOT_TOKEN not found in environment variables")
-    print("Available environment variables:")
-    for key in os.environ.keys():
-        if 'BOT' in key.upper() or 'TOKEN' in key.upper():
-            print(f"  {key}: {os.environ[key][:10]}...")
-    raise ValueError("BOT_TOKEN environment variable is required")
+    print("❌ BOT_TOKEN is not set")
+    raise ValueError("BOT_TOKEN is required")
 
 print(f"✅ Bot token loaded: {BOT_TOKEN[:10]}...")
 
 # MongoDB configuration
-MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
 if MONGO_URI.startswith('mongodb+srv://'):
     print("✅ Using MongoDB Atlas connection")
 else:
     print("✅ Using local MongoDB connection")
 
 # SSH configuration
-SSH_TIMEOUT = int(os.getenv('SSH_TIMEOUT', '15'))
-MAX_CONNECTIONS = int(os.getenv('MAX_CONNECTIONS', '10'))
+SSH_TIMEOUT = 15
+MAX_CONNECTIONS = 10
 
 # File manager configuration
-MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', '50')) * 1024 * 1024  # Convert MB to bytes
-ALLOWED_EXTENSIONS = os.getenv('ALLOWED_EXTENSIONS', '').split(',') if os.getenv('ALLOWED_EXTENSIONS') else []
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+ALLOWED_EXTENSIONS = []
 
 # Logging configuration
-LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+LOG_LEVEL = 'INFO'
 
 print(f"✅ Configuration loaded successfully")
 print(f"  - SSH Timeout: {SSH_TIMEOUT}s")
 print(f"  - Max Connections: {MAX_CONNECTIONS}")
-print(f"  - Max File Size: {MAX_FILE_SIZE // (1024*1024)}MB")
-print(f"  - Log Level: {LOG_LEVEL}")
+print(f"  - Max File Size: {MAX_FILE_SIZE // (1024*1024)}MB") 
+print(f"  - Log Level: {LOG_LEVEL}") 
