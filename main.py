@@ -1,54 +1,30 @@
 import logging
 import io
-import os
-import sys
-from pathlib import Path
 import paramiko
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.utils import executor
-from datetime import datetime
-
-# Add the project root to Python path for imports
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
-try:
-    from bot.config import BOT_TOKEN, LOG_LEVEL
-    from bot.db import (
-        add_server,
-        get_servers,
-        get_server_by_id,
-        update_server_name,
-        update_server_username,
-        delete_server_by_id
-    )
-    from bot.file_manager import init_file_manager
-except ImportError as e:
-    print(f"❌ Import error: {e}")
-    print("Make sure all required files are in the correct location")
-    sys.exit(1)
-
+from config import BOT_TOKEN
+from db import (
+    add_server,
+    get_servers,
+    get_server_by_id,
+    update_server_name,
+    update_server_username,
+    delete_server_by_id
+)
 from bson.objectid import ObjectId
 from bson.errors import InvalidId
+from file_manager import init_file_manager
+from datetime import datetime
 
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize bot and dispatcher
-try:
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(bot)
-    dp.middleware.setup(LoggingMiddleware())
-    logger.info("✅ Bot initialized successfully")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize bot: {e}")
-    sys.exit(1)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
 
 # --- UTILS ---
 
@@ -843,12 +819,8 @@ async def errors_handler(update, exception):
 
 if __name__ == '__main__':
     logger.info("🚀 Starting Multi Server Manager Bot...")
-    try:
-        executor.start_polling(
-            dp,
-            skip_updates=True,
-            on_startup=on_startup
-        )
-    except Exception as e:
-        logger.error(f"❌ Failed to start bot: {e}")
-        sys.exit(1)
+    executor.start_polling(
+        dp,
+        skip_updates=True,
+        on_startup=on_startup
+    )
