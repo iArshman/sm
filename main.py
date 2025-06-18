@@ -17,6 +17,7 @@ from db import (
 from bson.objectid import ObjectId
 from bson.errors import InvalidId
 from file_manager import init_file_manager
+from bot_manager import init_bot_manager
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
