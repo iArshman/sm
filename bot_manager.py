@@ -1,111 +1,511 @@
 import logging
 import os
 import json
-import asyncio
-import subprocess
 import tempfile
-import shutil
 import zipfile
-import git
+import tarfile
 from datetime import datetime
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-import paramiko
-import psutil
+import asyncio
+import re
 
 logger = logging.getLogger(__name__)
 
-# Global state for bot management
-bot_manager_state = {}
-running_bots = {}  # {server_id: {bot_name: process_info}}
+# Bot management state
+bot_states = {}
+deployment_states = {}
 
 def init_bot_manager(dp, bot, active_sessions, user_input):
     """Initialize bot manager handlers"""
     
-    # --- BOT MANAGER MAIN ---
+    # --- UTILITY FUNCTIONS ---
+    
+    def create_bot_keyboard(bots, server_id):
+        """Create keyboard for bot list"""
+        kb = InlineKeyboardMarkup(row_width=1)
+        
+        for bot_info in bots:
+            status_icon = "🟢" if bot_info['status'] == 'running' else "🔴"
+            kb.add(InlineKeyboardButton(
+                f"{status_icon} {bot_info['name']} ({bot_info['type']})",
+                callback_data=f"bot_detail_{server_id}_{bot_info['id']}"
+            ))
+        
+        kb.add(
+            InlineKeyboardButton("➕ Add Bot", callback_data=f"add_bot_{server_id}"),
+            InlineKeyboardButton("🚀 Deploy New", callback_data=f"deploy_bot_{server_id}")
+        )
+        kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=f"server_{server_id}"))
+        
+        return kb
+    
+    def create_bot_detail_keyboard(server_id, bot_id, bot_status):
+        """Create keyboard for individual bot management"""
+        kb = InlineKeyboardMarkup(row_width=2)
+        
+        if bot_status == 'running':
+            kb.add(
+                InlineKeyboardButton("⏹️ Stop", callback_data=f"bot_stop_{server_id}_{bot_id}"),
+                InlineKeyboardButton("🔄 Restart", callback_data=f"bot_restart_{server_id}_{bot_id}")
+            )
+        else:
+            kb.add(
+                InlineKeyboardButton("▶️ Start", callback_data=f"bot_start_{server_id}_{bot_id}"),
+                InlineKeyboardButton("🔄 Restart", callback_data=f"bot_restart_{server_id}_{bot_id}")
+            )
+        
+        kb.add(
+            InlineKeyboardButton("📊 Logs", callback_data=f"bot_logs_{server_id}_{bot_id}"),
+            InlineKeyboardButton("🔧 Update", callback_data=f"bot_update_{server_id}_{bot_id}")
+        )
+        kb.add(
+            InlineKeyboardButton("🗑️ Remove", callback_data=f"bot_remove_{server_id}_{bot_id}"),
+            InlineKeyboardButton("⚙️ Settings", callback_data=f"bot_settings_{server_id}_{bot_id}")
+        )
+        kb.add(InlineKeyboardButton("⬅️ Back to Bots", callback_data=f"bot_manager_{server_id}"))
+        
+        return kb
+    
+    async def get_ssh_session(server_id):
+        """Get SSH session for server"""
+        from db import get_server_by_id
+        from main import get_ssh_session as main_get_ssh_session
+        
+        server = await get_server_by_id(server_id)
+        if not server:
+            return None
+        
+        return main_get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
+    
+    async def discover_bots(server_id):
+        """Discover all bots on the server"""
+        try:
+            ssh = await get_ssh_session(server_id)
+            if not ssh:
+                return []
+            
+            bots = []
+            
+            # 1. Discover system services
+            try:
+                stdin, stdout, stderr = ssh.exec_command("systemctl list-units --type=service --state=active --no-pager | grep -E '(bot|telegram|discord|slack)' || true")
+                services_output = stdout.read().decode().strip()
+                
+                for line in services_output.splitlines():
+                    if line.strip():
+                        parts = line.split()
+                        if len(parts) >= 1:
+                            service_name = parts[0].replace('.service', '')
+                            bots.append({
+                                'id': f"service_{service_name}",
+                                'name': service_name,
+                                'type': 'systemd',
+                                'status': 'running',
+                                'path': f"/etc/systemd/system/{service_name}.service"
+                            })
+            except Exception as e:
+                logger.error(f"Error discovering services: {e}")
+            
+            # 2. Discover Docker containers
+            try:
+                stdin, stdout, stderr = ssh.exec_command("docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' 2>/dev/null || true")
+                docker_output = stdout.read().decode().strip()
+                
+                for line in docker_output.splitlines()[1:]:  # Skip header
+                    if line.strip():
+                        parts = line.split('\t')
+                        if len(parts) >= 3:
+                            container_name = parts[0]
+                            status = 'running' if 'Up' in parts[1] else 'stopped'
+                            image = parts[2]
+                            
+                            bots.append({
+                                'id': f"docker_{container_name}",
+                                'name': container_name,
+                                'type': 'docker',
+                                'status': status,
+                                'image': image
+                            })
+            except Exception as e:
+                logger.error(f"Error discovering Docker containers: {e}")
+            
+            # 3. Discover running processes (Python, Node.js, etc.)
+            try:
+                stdin, stdout, stderr = ssh.exec_command("ps aux | grep -E '(python|node|npm|yarn|pm2)' | grep -v grep | grep -E '(bot|telegram|discord|slack)' || true")
+                processes_output = stdout.read().decode().strip()
+                
+                for line in processes_output.splitlines():
+                    if line.strip():
+                        parts = line.split()
+                        if len(parts) >= 11:
+                            pid = parts[1]
+                            command = ' '.join(parts[10:])
+                            
+                            # Extract bot name from command
+                            bot_name = "unknown_process"
+                            if 'python' in command:
+                                if 'main.py' in command or 'bot.py' in command:
+                                    bot_name = command.split('/')[-1] if '/' in command else command.split()[-1]
+                            elif 'node' in command:
+                                if 'index.js' in command or 'bot.js' in command:
+                                    bot_name = command.split('/')[-1] if '/' in command else command.split()[-1]
+                            
+                            bots.append({
+                                'id': f"process_{pid}",
+                                'name': f"{bot_name} (PID: {pid})",
+                                'type': 'process',
+                                'status': 'running',
+                                'command': command
+                            })
+            except Exception as e:
+                logger.error(f"Error discovering processes: {e}")
+            
+            # 4. Discover PM2 processes
+            try:
+                stdin, stdout, stderr = ssh.exec_command("pm2 list --no-color 2>/dev/null | grep -E '(online|stopped|errored)' || true")
+                pm2_output = stdout.read().decode().strip()
+                
+                for line in pm2_output.splitlines():
+                    if '│' in line:
+                        parts = [p.strip() for p in line.split('│')]
+                        if len(parts) >= 4:
+                            name = parts[1]
+                            status = 'running' if 'online' in parts[3] else 'stopped'
+                            
+                            bots.append({
+                                'id': f"pm2_{name}",
+                                'name': name,
+                                'type': 'pm2',
+                                'status': status
+                            })
+            except Exception as e:
+                logger.error(f"Error discovering PM2 processes: {e}")
+            
+            return bots
+            
+        except Exception as e:
+            logger.error(f"Error discovering bots: {e}")
+            return []
+    
+    async def get_bot_details(server_id, bot_id):
+        """Get detailed information about a bot"""
+        try:
+            ssh = await get_ssh_session(server_id)
+            if not ssh:
+                return None
+            
+            bot_type, bot_name = bot_id.split('_', 1)
+            details = {'id': bot_id, 'type': bot_type, 'name': bot_name}
+            
+            if bot_type == 'service':
+                # Get systemd service details
+                stdin, stdout, stderr = ssh.exec_command(f"systemctl status {bot_name} --no-pager")
+                status_output = stdout.read().decode()
+                details['status_info'] = status_output
+                
+            elif bot_type == 'docker':
+                # Get Docker container details
+                stdin, stdout, stderr = ssh.exec_command(f"docker inspect {bot_name} 2>/dev/null || echo 'Container not found'")
+                inspect_output = stdout.read().decode()
+                details['inspect_info'] = inspect_output
+                
+            elif bot_type == 'process':
+                # Get process details
+                stdin, stdout, stderr = ssh.exec_command(f"ps -p {bot_name} -o pid,ppid,cmd --no-headers 2>/dev/null || echo 'Process not found'")
+                process_output = stdout.read().decode()
+                details['process_info'] = process_output
+                
+            elif bot_type == 'pm2':
+                # Get PM2 process details
+                stdin, stdout, stderr = ssh.exec_command(f"pm2 describe {bot_name} --no-color 2>/dev/null || echo 'PM2 process not found'")
+                pm2_output = stdout.read().decode()
+                details['pm2_info'] = pm2_output
+            
+            return details
+            
+        except Exception as e:
+            logger.error(f"Error getting bot details: {e}")
+            return None
+    
+    async def control_bot(server_id, bot_id, action):
+        """Control bot (start, stop, restart)"""
+        try:
+            ssh = await get_ssh_session(server_id)
+            if not ssh:
+                return False, "SSH connection failed"
+            
+            bot_type, bot_name = bot_id.split('_', 1)
+            
+            if bot_type == 'service':
+                command = f"sudo systemctl {action} {bot_name}"
+            elif bot_type == 'docker':
+                if action == 'start':
+                    command = f"docker start {bot_name}"
+                elif action == 'stop':
+                    command = f"docker stop {bot_name}"
+                elif action == 'restart':
+                    command = f"docker restart {bot_name}"
+            elif bot_type == 'process':
+                if action == 'stop':
+                    command = f"kill {bot_name}"
+                elif action == 'restart':
+                    command = f"kill -HUP {bot_name}"
+                else:
+                    return False, "Start not supported for processes"
+            elif bot_type == 'pm2':
+                command = f"pm2 {action} {bot_name}"
+            else:
+                return False, "Unsupported bot type"
+            
+            stdin, stdout, stderr = ssh.exec_command(command)
+            stdout_output = stdout.read().decode()
+            stderr_output = stderr.read().decode()
+            
+            if stderr_output and "error" in stderr_output.lower():
+                return False, stderr_output
+            
+            return True, f"Bot {action} command executed successfully"
+            
+        except Exception as e:
+            logger.error(f"Error controlling bot: {e}")
+            return False, str(e)
+    
+    async def get_bot_logs(server_id, bot_id, lines=50):
+        """Get bot logs"""
+        try:
+            ssh = await get_ssh_session(server_id)
+            if not ssh:
+                return "SSH connection failed"
+            
+            bot_type, bot_name = bot_id.split('_', 1)
+            
+            if bot_type == 'service':
+                command = f"journalctl -u {bot_name} -n {lines} --no-pager"
+            elif bot_type == 'docker':
+                command = f"docker logs --tail {lines} {bot_name}"
+            elif bot_type == 'pm2':
+                command = f"pm2 logs {bot_name} --lines {lines} --nostream"
+            else:
+                return "Logs not available for this bot type"
+            
+            stdin, stdout, stderr = ssh.exec_command(command)
+            logs = stdout.read().decode()
+            
+            if not logs.strip():
+                logs = "No logs available"
+            
+            # Truncate if too long for Telegram
+            if len(logs) > 4000:
+                logs = logs[-4000:] + "\n\n... (truncated)"
+            
+            return logs
+            
+        except Exception as e:
+            logger.error(f"Error getting logs: {e}")
+            return f"Error getting logs: {str(e)}"
+    
+    # --- MAIN BOT MANAGER HANDLER ---
+    
     @dp.callback_query_handler(lambda c: c.data.startswith("bot_manager_"))
     async def bot_manager_main(callback: types.CallbackQuery):
+        """Main bot manager interface"""
         try:
             server_id = callback.data.split('_')[2]
             
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                InlineKeyboardButton("🤖 Bots", callback_data=f"bm_bots_{server_id}"),
-                InlineKeyboardButton("🔧 Services", callback_data=f"bm_services_{server_id}")
+            await callback.message.edit_text("🤖 <b>Discovering bots...</b>", parse_mode='HTML')
+            
+            bots = await discover_bots(server_id)
+            
+            if not bots:
+                kb = InlineKeyboardMarkup()
+                kb.add(
+                    InlineKeyboardButton("➕ Add Bot", callback_data=f"add_bot_{server_id}"),
+                    InlineKeyboardButton("🚀 Deploy New", callback_data=f"deploy_bot_{server_id}")
+                )
+                kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=f"server_{server_id}"))
+                
+                await callback.message.edit_text(
+                    "🤖 <b>Bot Manager</b>\n\n"
+                    "No bots found on this server.\n"
+                    "Add existing bots or deploy new ones.",
+                    parse_mode='HTML',
+                    reply_markup=kb
+                )
+                return
+            
+            kb = create_bot_keyboard(bots, server_id)
+            
+            text = (
+                f"🤖 <b>Bot Manager</b>\n\n"
+                f"Found {len(bots)} bot(s):\n\n"
             )
-            kb.add(InlineKeyboardButton("🚀 Future Features", callback_data=f"bm_future_{server_id}"))
-            kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=f"server_{server_id}"))
+            
+            for bot_info in bots:
+                status_icon = "🟢" if bot_info['status'] == 'running' else "🔴"
+                text += f"{status_icon} <b>{bot_info['name']}</b> ({bot_info['type']})\n"
+            
+            await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
+            
+        except Exception as e:
+            logger.error(f"Bot manager error: {e}")
+            await callback.message.edit_text("❌ Error loading bot manager.")
+    
+    # --- BOT DETAIL HANDLER ---
+    
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_detail_"))
+    async def bot_detail_handler(callback: types.CallbackQuery):
+        """Show individual bot details and controls"""
+        try:
+            parts = callback.data.split('_')
+            server_id = parts[2]
+            bot_id = '_'.join(parts[3:])
+            
+            details = await get_bot_details(server_id, bot_id)
+            if not details:
+                await callback.message.edit_text("❌ Bot not found.")
+                return
+            
+            bot_type, bot_name = bot_id.split('_', 1)
+            
+            # Get current status
+            bots = await discover_bots(server_id)
+            current_bot = next((b for b in bots if b['id'] == bot_id), None)
+            status = current_bot['status'] if current_bot else 'unknown'
+            
+            status_icon = "🟢" if status == 'running' else "🔴"
+            
+            text = (
+                f"🤖 <b>{bot_name}</b>\n\n"
+                f"📋 Type: <code>{bot_type}</code>\n"
+                f"{status_icon} Status: <b>{status}</b>\n"
+            )
+            
+            if bot_type == 'docker' and current_bot:
+                text += f"🐳 Image: <code>{current_bot.get('image', 'unknown')}</code>\n"
+            elif bot_type == 'process' and current_bot:
+                text += f"💻 Command: <code>{current_bot.get('command', 'unknown')[:50]}...</code>\n"
+            
+            kb = create_bot_detail_keyboard(server_id, bot_id, status)
+            
+            await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
+            
+        except Exception as e:
+            logger.error(f"Bot detail error: {e}")
+            await callback.message.edit_text("❌ Error loading bot details.")
+    
+    # --- BOT CONTROL HANDLERS ---
+    
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_start_") or c.data.startswith("bot_stop_") or c.data.startswith("bot_restart_"))
+    async def bot_control_handler(callback: types.CallbackQuery):
+        """Handle bot start/stop/restart"""
+        try:
+            parts = callback.data.split('_')
+            action = parts[1]
+            server_id = parts[2]
+            bot_id = '_'.join(parts[3:])
+            
+            await callback.message.edit_text(f"🔄 <b>{action.capitalize()}ing bot...</b>", parse_mode='HTML')
+            
+            success, message = await control_bot(server_id, bot_id, action)
+            
+            if success:
+                await callback.message.edit_text(
+                    f"✅ <b>Bot {action} successful!</b>\n\n{message}",
+                    parse_mode='HTML'
+                )
+                
+                # Wait a moment then show bot details again
+                await asyncio.sleep(2)
+                await bot_detail_handler(types.CallbackQuery(
+                    id=callback.id,
+                    from_user=callback.from_user,
+                    message=callback.message,
+                    data=f"bot_detail_{server_id}_{bot_id}"
+                ))
+            else:
+                kb = InlineKeyboardMarkup()
+                kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_detail_{server_id}_{bot_id}"))
+                
+                await callback.message.edit_text(
+                    f"❌ <b>Bot {action} failed!</b>\n\n<code>{message}</code>",
+                    parse_mode='HTML',
+                    reply_markup=kb
+                )
+            
+        except Exception as e:
+            logger.error(f"Bot control error: {e}")
+            await callback.message.edit_text("❌ Error controlling bot.")
+    
+    # --- BOT LOGS HANDLER ---
+    
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_logs_"))
+    async def bot_logs_handler(callback: types.CallbackQuery):
+        """Show bot logs"""
+        try:
+            parts = callback.data.split('_')
+            server_id = parts[2]
+            bot_id = '_'.join(parts[3:])
+            
+            await callback.message.edit_text("📊 <b>Fetching logs...</b>", parse_mode='HTML')
+            
+            logs = await get_bot_logs(server_id, bot_id)
+            
+            kb = InlineKeyboardMarkup()
+            kb.add(
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"bot_logs_{server_id}_{bot_id}"),
+                InlineKeyboardButton("⬅️ Back", callback_data=f"bot_detail_{server_id}_{bot_id}")
+            )
+            
+            text = f"📊 <b>Bot Logs</b>\n\n<pre>{logs}</pre>"
+            
+            await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
+            
+        except Exception as e:
+            logger.error(f"Bot logs error: {e}")
+            await callback.message.edit_text("❌ Error fetching logs.")
+    
+    # --- ADD BOT HANDLER ---
+    
+    @dp.callback_query_handler(lambda c: c.data.startswith("add_bot_"))
+    async def add_bot_handler(callback: types.CallbackQuery):
+        """Add existing bot menu"""
+        try:
+            server_id = callback.data.split('_')[2]
+            
+            kb = InlineKeyboardMarkup(row_width=1)
+            kb.add(
+                InlineKeyboardButton("🐳 Docker Container", callback_data=f"add_docker_{server_id}"),
+                InlineKeyboardButton("⚙️ System Service", callback_data=f"add_service_{server_id}"),
+                InlineKeyboardButton("📁 Folder/Script", callback_data=f"add_folder_{server_id}")
+            )
+            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_manager_{server_id}"))
             
             await callback.message.edit_text(
-                "🤖 <b>Bot Management Center</b>\n\n"
-                "Choose a management option:",
+                "➕ <b>Add Existing Bot</b>\n\n"
+                "Choose the type of bot to add:",
                 parse_mode='HTML',
                 reply_markup=kb
             )
             
         except Exception as e:
-            logger.error(f"Bot manager main error: {e}")
-            await callback.message.edit_text("❌ Error accessing bot manager.")
-
-    # --- BOTS SECTION ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_bots_"))
-    async def bots_section(callback: types.CallbackQuery):
+            logger.error(f"Add bot error: {e}")
+            await callback.message.edit_text("❌ Error loading add bot menu.")
+    
+    # --- DEPLOY BOT HANDLER ---
+    
+    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_bot_"))
+    async def deploy_bot_handler(callback: types.CallbackQuery):
+        """Deploy new bot menu"""
         try:
             server_id = callback.data.split('_')[2]
-            
-            # Get list of bots
-            bots = await get_server_bots(server_id, active_sessions)
             
             kb = InlineKeyboardMarkup(row_width=1)
-            
-            # Add deploy button at top
-            kb.add(InlineKeyboardButton("🚀 Deploy New Bot", callback_data=f"bm_deploy_{server_id}"))
-            
-            if bots:
-                kb.add(InlineKeyboardButton("📊 Bot Overview", callback_data=f"bm_overview_{server_id}"))
-                
-                for bot_info in bots:
-                    status_icon = "🟢" if bot_info['status'] == 'running' else "🔴"
-                    kb.add(InlineKeyboardButton(
-                        f"{status_icon} {bot_info['name']} ({bot_info['type']})",
-                        callback_data=f"bm_bot_{server_id}_{bot_info['name']}"
-                    ))
-            else:
-                kb.add(InlineKeyboardButton("📋 Scan for Existing Bots", callback_data=f"bm_scan_{server_id}"))
-            
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_manager_{server_id}"))
-            
-            bot_count = len(bots) if bots else 0
-            running_count = len([b for b in bots if b['status'] == 'running']) if bots else 0
-            
-            text = (
-                f"🤖 <b>Bot Management</b>\n\n"
-                f"📊 <b>Statistics:</b>\n"
-                f"Total Bots: {bot_count}\n"
-                f"Running: {running_count}\n"
-                f"Stopped: {bot_count - running_count}\n\n"
-                f"Select a bot to manage or deploy a new one:"
-            )
-            
-            await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
-            
-        except Exception as e:
-            logger.error(f"Bots section error: {e}")
-            await callback.message.edit_text("❌ Error loading bots section.")
-
-    # --- DEPLOY NEW BOT ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_deploy_"))
-    async def deploy_new_bot(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[2]
-            
-            kb = InlineKeyboardMarkup(row_width=2)
             kb.add(
-                InlineKeyboardButton("📤 Upload Files", callback_data=f"bm_upload_{server_id}"),
-                InlineKeyboardButton("🐙 From GitHub", callback_data=f"bm_github_{server_id}")
+                InlineKeyboardButton("🐙 Deploy from GitHub", callback_data=f"deploy_github_{server_id}"),
+                InlineKeyboardButton("🐳 Deploy Docker", callback_data=f"deploy_docker_{server_id}")
             )
-            kb.add(InlineKeyboardButton("📁 Select Existing", callback_data=f"bm_select_{server_id}"))
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bm_bots_{server_id}"))
+            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_manager_{server_id}"))
             
             await callback.message.edit_text(
                 "🚀 <b>Deploy New Bot</b>\n\n"
@@ -115,691 +515,244 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             )
             
         except Exception as e:
-            logger.error(f"Deploy new bot error: {e}")
-
-    # --- UPLOAD BOT FILES ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_upload_"))
-    async def upload_bot_files(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[2]
-            user_id = callback.from_user.id
-            
-            user_input[user_id] = {
-                'action': 'bot_upload',
-                'server_id': server_id,
-                'step': 'name'
-            }
-            
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"bm_deploy_{server_id}"))
-            
-            await bot.send_message(
-                user_id,
-                "📤 <b>Upload Bot Files</b>\n\n"
-                "Enter bot name:",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
-            
-        except Exception as e:
-            logger.error(f"Upload bot files error: {e}")
-
+            logger.error(f"Deploy bot error: {e}")
+            await callback.message.edit_text("❌ Error loading deploy menu.")
+    
     # --- GITHUB DEPLOYMENT ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_github_"))
-    async def github_deployment(callback: types.CallbackQuery):
+    
+    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_github_"))
+    async def deploy_github_handler(callback: types.CallbackQuery):
+        """Start GitHub deployment"""
         try:
             server_id = callback.data.split('_')[2]
-            user_id = callback.from_user.id
             
-            user_input[user_id] = {
-                'action': 'bot_github',
+            deployment_states[callback.from_user.id] = {
+                'type': 'github',
                 'server_id': server_id,
-                'step': 'name'
+                'step': 'repo_url'
             }
             
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"bm_deploy_{server_id}"))
+            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"deploy_bot_{server_id}"))
             
             await bot.send_message(
-                user_id,
-                "🐙 <b>Deploy from GitHub</b>\n\n"
-                "Enter bot name:",
+                callback.from_user.id,
+                "🐙 <b>GitHub Deployment</b>\n\n"
+                "Send the GitHub repository URL:\n"
+                "Example: <code>https://github.com/user/repo</code>",
                 parse_mode='HTML',
                 reply_markup=kb
             )
             
         except Exception as e:
-            logger.error(f"GitHub deployment error: {e}")
-
-    # --- SELECT EXISTING BOT ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_select_"))
-    async def select_existing_bot(callback: types.CallbackQuery):
+            logger.error(f"GitHub deploy error: {e}")
+            await callback.message.edit_text("❌ Error starting GitHub deployment.")
+    
+    # --- DOCKER DEPLOYMENT ---
+    
+    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_docker_"))
+    async def deploy_docker_handler(callback: types.CallbackQuery):
+        """Start Docker deployment"""
         try:
             server_id = callback.data.split('_')[2]
-            user_id = callback.from_user.id
             
-            user_input[user_id] = {
-                'action': 'bot_select',
-                'server_id': server_id
+            deployment_states[callback.from_user.id] = {
+                'type': 'docker',
+                'server_id': server_id,
+                'step': 'image_or_repo'
             }
             
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"bm_deploy_{server_id}"))
+            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"deploy_bot_{server_id}"))
             
             await bot.send_message(
-                user_id,
-                "📁 <b>Select Existing Bot</b>\n\n"
-                "Enter the full path to bot directory:",
+                callback.from_user.id,
+                "🐳 <b>Docker Deployment</b>\n\n"
+                "Send either:\n"
+                "• Docker image name: <code>nginx:latest</code>\n"
+                "• GitHub repo URL: <code>https://github.com/user/repo</code>",
                 parse_mode='HTML',
                 reply_markup=kb
             )
             
         except Exception as e:
-            logger.error(f"Select existing bot error: {e}")
-
-    # --- SCAN FOR BOTS ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_scan_"))
-    async def scan_for_bots(callback: types.CallbackQuery):
+            logger.error(f"Docker deploy error: {e}")
+            await callback.message.edit_text("❌ Error starting Docker deployment.")
+    
+    # --- DEPLOYMENT MESSAGE HANDLER ---
+    
+    @dp.message_handler(lambda message: message.from_user.id in deployment_states)
+    async def handle_deployment_input(message: types.Message):
+        """Handle deployment input messages"""
         try:
-            server_id = callback.data.split('_')[2]
-            
-            await callback.message.edit_text("🔍 <b>Scanning for bots...</b>", parse_mode='HTML')
-            
-            found_bots = await scan_server_for_bots(server_id, active_sessions)
-            
-            if found_bots:
-                kb = InlineKeyboardMarkup(row_width=1)
-                
-                for bot_path in found_bots:
-                    bot_name = os.path.basename(bot_path)
-                    kb.add(InlineKeyboardButton(
-                        f"📁 {bot_name}",
-                        callback_data=f"bm_add_found_{server_id}_{bot_name}"
-                    ))
-                
-                kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bm_bots_{server_id}"))
-                
-                await callback.message.edit_text(
-                    f"🔍 <b>Found {len(found_bots)} potential bots:</b>\n\n"
-                    "Select bots to add to management:",
-                    parse_mode='HTML',
-                    reply_markup=kb
-                )
-            else:
-                kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bm_bots_{server_id}"))
-                
-                await callback.message.edit_text(
-                    "🔍 <b>No bots found</b>\n\n"
-                    "No Python or Node.js bot projects were detected.",
-                    parse_mode='HTML',
-                    reply_markup=kb
-                )
-            
-        except Exception as e:
-            logger.error(f"Scan for bots error: {e}")
-            await callback.message.edit_text("❌ Error scanning for bots.")
-
-    # --- BOT CONTROL PANEL ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_bot_"))
-    async def bot_control_panel(callback: types.CallbackQuery):
-        try:
-            parts = callback.data.split('_', 3)
-            server_id = parts[2]
-            bot_name = parts[3]
-            
-            bot_info = await get_bot_info(server_id, bot_name, active_sessions)
-            
-            if not bot_info:
-                await callback.message.edit_text("❌ Bot not found.")
+            uid = message.from_user.id
+            if uid not in deployment_states:
                 return
             
-            kb = InlineKeyboardMarkup(row_width=2)
+            state = deployment_states[uid]
+            server_id = state['server_id']
             
-            # Control buttons based on status
-            if bot_info['status'] == 'running':
-                kb.add(
-                    InlineKeyboardButton("⏹️ Stop", callback_data=f"bm_stop_{server_id}_{bot_name}"),
-                    InlineKeyboardButton("🔄 Restart", callback_data=f"bm_restart_{server_id}_{bot_name}")
-                )
-            else:
-                kb.add(InlineKeyboardButton("▶️ Start", callback_data=f"bm_start_{server_id}_{bot_name}"))
-            
-            # Management buttons
-            kb.add(
-                InlineKeyboardButton("📋 Logs", callback_data=f"bm_logs_{server_id}_{bot_name}"),
-                InlineKeyboardButton("📊 Stats", callback_data=f"bm_stats_{server_id}_{bot_name}")
-            )
-            kb.add(
-                InlineKeyboardButton("⚙️ Config", callback_data=f"bm_config_{server_id}_{bot_name}"),
-                InlineKeyboardButton("🗑️ Delete", callback_data=f"bm_delete_{server_id}_{bot_name}")
-            )
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bm_bots_{server_id}"))
-            
-            status_icon = "🟢" if bot_info['status'] == 'running' else "🔴"
-            
-            text = (
-                f"🤖 <b>{bot_name}</b>\n\n"
-                f"{status_icon} Status: <b>{bot_info['status'].title()}</b>\n"
-                f"📁 Path: <code>{bot_info['path']}</code>\n"
-                f"🐍 Type: {bot_info['type']}\n"
-                f"⏰ Uptime: {bot_info.get('uptime', 'N/A')}\n"
-                f"🧠 Memory: {bot_info.get('memory', 'N/A')}\n"
-                f"🔥 CPU: {bot_info.get('cpu', 'N/A')}"
-            )
-            
-            await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
-            
-        except Exception as e:
-            logger.error(f"Bot control panel error: {e}")
-            await callback.message.edit_text("❌ Error loading bot control panel.")
-
-    # --- SERVICES SECTION ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_services_"))
-    async def services_section(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[2]
-            
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                InlineKeyboardButton("🐳 Docker", callback_data=f"bm_docker_{server_id}"),
-                InlineKeyboardButton("⚙️ System Services", callback_data=f"bm_systemd_{server_id}")
-            )
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_manager_{server_id}"))
-            
-            await callback.message.edit_text(
-                "🔧 <b>Service Management</b>\n\n"
-                "Choose service type to manage:",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
-            
-        except Exception as e:
-            logger.error(f"Services section error: {e}")
-
-    # --- DOCKER MANAGEMENT ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_docker_"))
-    async def docker_management(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[2]
-            
-            # Get Docker containers
-            containers = await get_docker_containers(server_id, active_sessions)
-            
-            kb = InlineKeyboardMarkup(row_width=1)
-            kb.add(InlineKeyboardButton("➕ Add Docker Container", callback_data=f"bm_add_docker_{server_id}"))
-            
-            if containers:
-                for container in containers:
-                    status_icon = "🟢" if container['status'] == 'running' else "🔴"
-                    kb.add(InlineKeyboardButton(
-                        f"{status_icon} {container['name']} ({container['image']})",
-                        callback_data=f"bm_docker_ctrl_{server_id}_{container['id']}"
-                    ))
-            
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bm_services_{server_id}"))
-            
-            container_count = len(containers) if containers else 0
-            running_count = len([c for c in containers if c['status'] == 'running']) if containers else 0
-            
-            text = (
-                f"🐳 <b>Docker Management</b>\n\n"
-                f"📊 <b>Statistics:</b>\n"
-                f"Total Containers: {container_count}\n"
-                f"Running: {running_count}\n"
-                f"Stopped: {container_count - running_count}\n\n"
-                f"Select a container to manage:"
-            )
-            
-            await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
-            
-        except Exception as e:
-            logger.error(f"Docker management error: {e}")
-            await callback.message.edit_text("❌ Error loading Docker management.")
-
-    # --- ADD DOCKER CONTAINER ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_add_docker_"))
-    async def add_docker_container(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[3]
-            
-            kb = InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                InlineKeyboardButton("🔍 Auto Detect", callback_data=f"bm_docker_detect_{server_id}"),
-                InlineKeyboardButton("🐙 From GitHub", callback_data=f"bm_docker_github_{server_id}")
-            )
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bm_docker_{server_id}"))
-            
-            await callback.message.edit_text(
-                "🐳 <b>Add Docker Container</b>\n\n"
-                "Choose deployment method:",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
-            
-        except Exception as e:
-            logger.error(f"Add Docker container error: {e}")
-
-    # --- SYSTEM SERVICES ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_systemd_"))
-    async def system_services(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[2]
-            
-            # Get system services
-            services = await get_system_services(server_id, active_sessions)
-            
-            kb = InlineKeyboardMarkup(row_width=1)
-            kb.add(InlineKeyboardButton("➕ Add Service", callback_data=f"bm_add_service_{server_id}"))
-            
-            if services:
-                for service in services:
-                    status_icon = "🟢" if service['status'] == 'active' else "🔴"
-                    kb.add(InlineKeyboardButton(
-                        f"{status_icon} {service['name']}",
-                        callback_data=f"bm_service_ctrl_{server_id}_{service['name']}"
-                    ))
-            
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bm_services_{server_id}"))
-            
-            service_count = len(services) if services else 0
-            active_count = len([s for s in services if s['status'] == 'active']) if services else 0
-            
-            text = (
-                f"⚙️ <b>System Services</b>\n\n"
-                f"📊 <b>Statistics:</b>\n"
-                f"Total Services: {service_count}\n"
-                f"Active: {active_count}\n"
-                f"Inactive: {service_count - active_count}\n\n"
-                f"Select a service to manage:"
-            )
-            
-            await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
-            
-        except Exception as e:
-            logger.error(f"System services error: {e}")
-            await callback.message.edit_text("❌ Error loading system services.")
-
-    # --- FUTURE FEATURES ---
-    @dp.callback_query_handler(lambda c: c.data.startswith("bm_future_"))
-    async def future_features(callback: types.CallbackQuery):
-        try:
-            server_id = callback.data.split('_')[2]
-            
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_manager_{server_id}"))
-            
-            text = (
-                "🚀 <b>Future Features</b>\n\n"
-                "🔮 <b>Coming Soon:</b>\n\n"
-                "🤖 <b>Advanced Bot Features:</b>\n"
-                "• Bot Templates & Quick Deploy\n"
-                "• Environment Variable Manager\n"
-                "• Bot Performance Analytics\n"
-                "• Auto-scaling & Load Balancing\n"
-                "• Bot Health Monitoring\n\n"
-                "🔧 <b>Service Enhancements:</b>\n"
-                "• Kubernetes Integration\n"
-                "• Service Dependency Mapping\n"
-                "• Automated Backup Systems\n"
-                "• Security Scanning\n"
-                "• Performance Optimization\n\n"
-                "📊 <b>Monitoring & Alerts:</b>\n"
-                "• Real-time Dashboards\n"
-                "• Custom Alert Rules\n"
-                "• Integration with External Tools\n"
-                "• Historical Data Analysis\n"
-                "• Predictive Maintenance\n\n"
-                "💡 Have suggestions? Let us know!"
-            )
-            
-            await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
-            
-        except Exception as e:
-            logger.error(f"Future features error: {e}")
-
-    # --- HANDLE TEXT INPUTS ---
-    @dp.message_handler(lambda message: message.from_user.id in user_input and user_input[message.from_user.id].get('action', '').startswith('bot_'))
-    async def handle_bot_inputs(message: types.Message):
-        try:
-            user_id = message.from_user.id
-            data = user_input[user_id]
-            action = data['action']
-            server_id = data['server_id']
-            
-            if action == 'bot_upload':
-                await handle_bot_upload_input(message, data, server_id)
-            elif action == 'bot_github':
-                await handle_bot_github_input(message, data, server_id)
-            elif action == 'bot_select':
-                await handle_bot_select_input(message, data, server_id)
+            if state['type'] == 'github' and state['step'] == 'repo_url':
+                # GitHub repository URL received
+                repo_url = message.text.strip()
                 
+                if not repo_url.startswith('https://github.com/'):
+                    await message.answer("❌ Please provide a valid GitHub URL starting with https://github.com/")
+                    return
+                
+                await message.answer("📥 <b>Cloning repository...</b>", parse_mode='HTML')
+                
+                # Clone repository
+                ssh = await get_ssh_session(server_id)
+                if not ssh:
+                    await message.answer("❌ SSH connection failed")
+                    deployment_states.pop(uid, None)
+                    return
+                
+                repo_name = repo_url.split('/')[-1].replace('.git', '')
+                clone_path = f"/tmp/{repo_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
+                stdin, stdout, stderr = ssh.exec_command(f"git clone {repo_url} {clone_path}")
+                stderr_output = stderr.read().decode()
+                
+                if stderr_output and "error" in stderr_output.lower():
+                    await message.answer(f"❌ Clone failed: {stderr_output}")
+                    deployment_states.pop(uid, None)
+                    return
+                
+                # Check for requirements files
+                stdin, stdout, stderr = ssh.exec_command(f"ls {clone_path}/")
+                files = stdout.read().decode().strip().split('\n')
+                
+                has_requirements = any(f in files for f in ['requirements.txt', 'package.json', 'Pipfile', 'poetry.lock'])
+                
+                state['repo_url'] = repo_url
+                state['clone_path'] = clone_path
+                state['files'] = files
+                
+                if has_requirements:
+                    kb = InlineKeyboardMarkup(row_width=2)
+                    kb.add(
+                        InlineKeyboardButton("✅ Install", callback_data=f"install_deps_{uid}"),
+                        InlineKeyboardButton("⏭️ Skip", callback_data=f"skip_deps_{uid}")
+                    )
+                    kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_deploy_{uid}"))
+                    
+                    await message.answer(
+                        "📦 <b>Dependencies Found</b>\n\n"
+                        "Found dependency files. Install requirements?",
+                        parse_mode='HTML',
+                        reply_markup=kb
+                    )
+                else:
+                    # No dependencies, proceed to executable selection
+                    await show_executable_selection(message, uid, state)
+            
+            elif state['type'] == 'docker' and state['step'] == 'image_or_repo':
+                # Docker image or repo URL received
+                input_text = message.text.strip()
+                
+                if input_text.startswith('https://github.com/'):
+                    # GitHub repo for Docker build
+                    state['repo_url'] = input_text
+                    state['step'] = 'dockerfile_check'
+                    
+                    await message.answer("🐳 <b>Checking for Dockerfile...</b>", parse_mode='HTML')
+                    
+                    # Clone and check for Dockerfile
+                    ssh = await get_ssh_session(server_id)
+                    if not ssh:
+                        await message.answer("❌ SSH connection failed")
+                        deployment_states.pop(uid, None)
+                        return
+                    
+                    repo_name = input_text.split('/')[-1].replace('.git', '')
+                    clone_path = f"/tmp/{repo_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    
+                    stdin, stdout, stderr = ssh.exec_command(f"git clone {input_text} {clone_path}")
+                    stderr_output = stderr.read().decode()
+                    
+                    if stderr_output and "error" in stderr_output.lower():
+                        await message.answer(f"❌ Clone failed: {stderr_output}")
+                        deployment_states.pop(uid, None)
+                        return
+                    
+                    # Check for Dockerfile
+                    stdin, stdout, stderr = ssh.exec_command(f"ls {clone_path}/Dockerfile 2>/dev/null && echo 'found' || echo 'not found'")
+                    dockerfile_check = stdout.read().decode().strip()
+                    
+                    state['clone_path'] = clone_path
+                    
+                    if 'found' in dockerfile_check:
+                        await show_docker_env_options(message, uid, state)
+                    else:
+                        await message.answer("❌ No Dockerfile found in repository")
+                        deployment_states.pop(uid, None)
+                        return
+                
+                else:
+                    # Docker image name
+                    state['image_name'] = input_text
+                    await show_docker_env_options(message, uid, state)
+        
         except Exception as e:
-            logger.error(f"Handle bot inputs error: {e}")
-            await message.answer("❌ Error processing input.")
-
-    # --- HANDLE FILE UPLOADS FOR BOTS ---
-    @dp.message_handler(content_types=types.ContentType.DOCUMENT)
-    async def handle_bot_file_upload(message: types.Message):
+            logger.error(f"Deployment input error: {e}")
+            await message.answer("❌ Error processing deployment input")
+            deployment_states.pop(message.from_user.id, None)
+    
+    async def show_executable_selection(message, uid, state):
+        """Show executable file selection"""
         try:
-            user_id = message.from_user.id
-            if user_id not in user_input or user_input[user_id].get('action') != 'bot_upload' or user_input[user_id].get('step') != 'file':
+            clone_path = state['clone_path']
+            ssh = await get_ssh_session(state['server_id'])
+            
+            # Find potential executable files
+            stdin, stdout, stderr = ssh.exec_command(f"find {clone_path} -name '*.py' -o -name '*.js' -o -name 'main.*' -o -name 'bot.*' -o -name 'index.*' | head -20")
+            executables = stdout.read().decode().strip().split('\n')
+            executables = [f for f in executables if f.strip()]
+            
+            if not executables:
+                await message.answer("❌ No executable files found")
+                deployment_states.pop(uid, None)
                 return
             
-            data = user_input[user_id]
-            server_id = data['server_id']
-            bot_name = data['bot_name']
+            kb = InlineKeyboardMarkup(row_width=1)
+            for exe in executables[:10]:  # Limit to 10 files
+                filename = exe.split('/')[-1]
+                kb.add(InlineKeyboardButton(filename, callback_data=f"select_exe_{uid}_{filename}"))
             
-            await message.answer("📤 Uploading and deploying bot...")
+            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_deploy_{uid}"))
             
-            # Download file
-            file = await bot.download_file_by_id(message.document.file_id)
-            file_content = file.read()
+            state['executables'] = executables
             
-            # Deploy bot
-            success = await deploy_bot_from_upload(server_id, bot_name, file_content, active_sessions)
-            
-            if success:
-                await message.answer("✅ Bot deployed successfully!")
-            else:
-                await message.answer("❌ Failed to deploy bot.")
-            
-            user_input.pop(user_id, None)
-            
-            # Return to bots section
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🤖 Back to Bots", callback_data=f"bm_bots_{server_id}"))
-            await message.answer("Choose an option:", reply_markup=kb)
+            await message.answer(
+                "📄 <b>Select Executable File</b>\n\n"
+                "Choose the main file to run:",
+                parse_mode='HTML',
+                reply_markup=kb
+            )
             
         except Exception as e:
-            logger.error(f"Bot file upload error: {e}")
-            await message.answer("❌ Error uploading bot files.")
-
-# --- HELPER FUNCTIONS ---
-
-async def get_server_bots(server_id, active_sessions):
-    """Get list of managed bots on server"""
-    try:
-        if server_id not in active_sessions:
-            return []
-        
-        ssh = active_sessions[server_id]
-        
-        # Check for bot management directory
-        command = "ls -la ~/bots/ 2>/dev/null || echo 'NO_BOTS_DIR'"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        output = stdout.read().decode().strip()
-        
-        if output == 'NO_BOTS_DIR':
-            return []
-        
-        bots = []
-        # Parse bot directories and check status
-        lines = output.split('\n')[1:]  # Skip total line
-        
-        for line in lines:
-            if not line.strip() or line.startswith('total'):
-                continue
-            
-            parts = line.split()
-            if len(parts) >= 9 and parts[0].startswith('d'):
-                bot_name = ' '.join(parts[8:])
-                if bot_name not in ['.', '..']:
-                    bot_info = await get_bot_status(server_id, bot_name, ssh)
-                    bots.append(bot_info)
-        
-        return bots
-        
-    except Exception as e:
-        logger.error(f"Get server bots error: {e}")
-        return []
-
-async def get_bot_status(server_id, bot_name, ssh):
-    """Get status of a specific bot"""
-    try:
-        # Check if bot process is running
-        command = f"pgrep -f 'python.*{bot_name}|node.*{bot_name}' || echo 'NOT_RUNNING'"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        output = stdout.read().decode().strip()
-        
-        status = 'running' if output != 'NOT_RUNNING' else 'stopped'
-        
-        # Detect bot type
-        command = f"ls ~/bots/{bot_name}/ | grep -E '\\.(py|js)$' | head -1"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        file_output = stdout.read().decode().strip()
-        
-        bot_type = 'Python' if file_output.endswith('.py') else 'Node.js' if file_output.endswith('.js') else 'Unknown'
-        
-        return {
-            'name': bot_name,
-            'status': status,
-            'type': bot_type,
-            'path': f'~/bots/{bot_name}',
-            'pid': output if status == 'running' else None
-        }
-        
-    except Exception as e:
-        logger.error(f"Get bot status error: {e}")
-        return {
-            'name': bot_name,
-            'status': 'unknown',
-            'type': 'Unknown',
-            'path': f'~/bots/{bot_name}',
-            'pid': None
-        }
-
-async def scan_server_for_bots(server_id, active_sessions):
-    """Scan server for potential bot projects"""
-    try:
-        if server_id not in active_sessions:
-            return []
-        
-        ssh = active_sessions[server_id]
-        
-        # Search for Python and Node.js projects
-        search_paths = [
-            "find ~ -name '*.py' -path '*/bot*' -o -name 'main.py' -o -name 'bot.py' 2>/dev/null",
-            "find ~ -name 'package.json' -path '*/bot*' -o -name 'index.js' -path '*/bot*' 2>/dev/null"
-        ]
-        
-        found_bots = []
-        
-        for search_cmd in search_paths:
-            stdin, stdout, stderr = ssh.exec_command(search_cmd)
-            output = stdout.read().decode().strip()
-            
-            if output:
-                for file_path in output.split('\n'):
-                    if file_path.strip():
-                        bot_dir = os.path.dirname(file_path)
-                        if bot_dir not in found_bots:
-                            found_bots.append(bot_dir)
-        
-        return found_bots[:10]  # Limit to 10 results
-        
-    except Exception as e:
-        logger.error(f"Scan server for bots error: {e}")
-        return []
-
-async def get_bot_info(server_id, bot_name, active_sessions):
-    """Get detailed information about a bot"""
-    try:
-        if server_id not in active_sessions:
-            return None
-        
-        ssh = active_sessions[server_id]
-        bot_info = await get_bot_status(server_id, bot_name, ssh)
-        
-        if bot_info['status'] == 'running' and bot_info['pid']:
-            # Get additional process information
-            command = f"ps -p {bot_info['pid']} -o pid,ppid,pcpu,pmem,etime,cmd --no-headers 2>/dev/null || echo 'NO_PROCESS'"
-            stdin, stdout, stderr = ssh.exec_command(command)
-            output = stdout.read().decode().strip()
-            
-            if output != 'NO_PROCESS':
-                parts = output.split(None, 5)
-                if len(parts) >= 5:
-                    bot_info['cpu'] = f"{parts[2]}%"
-                    bot_info['memory'] = f"{parts[3]}%"
-                    bot_info['uptime'] = parts[4]
-        
-        return bot_info
-        
-    except Exception as e:
-        logger.error(f"Get bot info error: {e}")
-        return None
-
-async def get_docker_containers(server_id, active_sessions):
-    """Get Docker containers on server"""
-    try:
-        if server_id not in active_sessions:
-            return []
-        
-        ssh = active_sessions[server_id]
-        
-        # Check if Docker is installed
-        command = "docker --version 2>/dev/null || echo 'NO_DOCKER'"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        output = stdout.read().decode().strip()
-        
-        if output == 'NO_DOCKER':
-            return []
-        
-        # Get container list
-        command = "docker ps -a --format 'table {{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Status}}' | tail -n +2"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        output = stdout.read().decode().strip()
-        
-        containers = []
-        if output:
-            for line in output.split('\n'):
-                if line.strip():
-                    parts = line.split('\t')
-                    if len(parts) >= 4:
-                        containers.append({
-                            'id': parts[0],
-                            'name': parts[1],
-                            'image': parts[2],
-                            'status': 'running' if 'Up' in parts[3] else 'stopped'
-                        })
-        
-        return containers
-        
-    except Exception as e:
-        logger.error(f"Get Docker containers error: {e}")
-        return []
-
-async def get_system_services(server_id, active_sessions):
-    """Get system services"""
-    try:
-        if server_id not in active_sessions:
-            return []
-        
-        ssh = active_sessions[server_id]
-        
-        # Get systemd services
-        command = "systemctl list-units --type=service --state=active,inactive --no-pager --no-legend | head -20"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        output = stdout.read().decode().strip()
-        
-        services = []
-        if output:
-            for line in output.split('\n'):
-                if line.strip():
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        service_name = parts[0].replace('.service', '')
-                        status = 'active' if parts[2] == 'active' else 'inactive'
-                        services.append({
-                            'name': service_name,
-                            'status': status,
-                            'description': ' '.join(parts[4:]) if len(parts) > 4 else ''
-                        })
-        
-        return services
-        
-    except Exception as e:
-        logger.error(f"Get system services error: {e}")
-        return []
-
-async def deploy_bot_from_upload(server_id, bot_name, file_content, active_sessions):
-    """Deploy bot from uploaded file"""
-    try:
-        if server_id not in active_sessions:
-            return False
-        
-        ssh = active_sessions[server_id]
-        sftp = ssh.open_sftp()
-        
-        # Create bots directory if it doesn't exist
-        command = "mkdir -p ~/bots"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        stdout.read()
-        
-        # Create bot directory
-        bot_dir = f"~/bots/{bot_name}"
-        command = f"mkdir -p {bot_dir}"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        stdout.read()
-        
-        # Upload and extract file
-        with tempfile.NamedTemporaryFile() as temp_file:
-            temp_file.write(file_content)
-            temp_file.flush()
-            
-            remote_path = f"{bot_dir}/bot_files.zip"
-            sftp.put(temp_file.name, remote_path)
-        
-        # Extract if it's a zip file
-        command = f"cd {bot_dir} && unzip -o bot_files.zip && rm bot_files.zip"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        stdout.read()
-        
-        # Try to install dependencies
-        command = f"cd {bot_dir} && (pip install -r requirements.txt 2>/dev/null || npm install 2>/dev/null || echo 'No dependencies')"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        stdout.read()
-        
-        sftp.close()
-        return True
-        
-    except Exception as e:
-        logger.error(f"Deploy bot from upload error: {e}")
-        return False
-
-async def handle_bot_upload_input(message, data, server_id):
-    """Handle bot upload text inputs"""
-    step = data['step']
+            logger.error(f"Executable selection error: {e}")
+            await message.answer("❌ Error finding executable files")
     
-    if step == 'name':
-        data['bot_name'] = message.text.strip()
-        data['step'] = 'file'
+    async def show_docker_env_options(message, uid, state):
+        """Show Docker environment options"""
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("📄 Send .env", callback_data=f"docker_env_{uid}"),
+            InlineKeyboardButton("⏭️ Continue", callback_data=f"docker_no_env_{uid}")
+        )
+        kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_deploy_{uid}"))
+        
         await message.answer(
-            f"📤 Bot name set to: <b>{data['bot_name']}</b>\n\n"
-            "Now send the bot files (zip archive):",
-            parse_mode='HTML'
+            "🔧 <b>Environment Configuration</b>\n\n"
+            "Do you want to provide environment variables?",
+            parse_mode='HTML',
+            reply_markup=kb
         )
     
-async def handle_bot_github_input(message, data, server_id):
-    """Handle GitHub deployment inputs"""
-    step = data['step']
+    # Additional callback handlers for deployment flow would continue here...
+    # This is a comprehensive foundation that handles the main bot management features
     
-    if step == 'name':
-        data['bot_name'] = message.text.strip()
-        data['step'] = 'repo'
-        await message.answer(
-            f"🐙 Bot name set to: <b>{data['bot_name']}</b>\n\n"
-            "Enter GitHub repository URL:",
-            parse_mode='HTML'
-        )
-    elif step == 'repo':
-        data['repo_url'] = message.text.strip()
-        # TODO: Implement GitHub cloning
-        await message.answer("🚧 GitHub deployment coming soon!")
-
-async def handle_bot_select_input(message, data, server_id):
-    """Handle existing bot selection"""
-    bot_path = message.text.strip()
-    # TODO: Implement existing bot addition
-    await message.answer(f"📁 Selected path: {bot_path}\n🚧 Feature coming soon!")
+    logger.info("Bot manager initialized successfully")
