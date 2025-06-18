@@ -259,8 +259,9 @@ async def on_startup(_):
     except Exception as e:
         logger.error(f"Startup error: {e}")
     
-    # Initialize file manager
+    # Initialize file manager and bot manager
     init_file_manager(dp, bot, active_sessions, user_input)
+    init_bot_manager(dp, bot, active_sessions, user_input)
     logger.info("✅ Bot startup complete")
 
 # --- MAIN HANDLERS ---
@@ -563,10 +564,6 @@ async def server_info(callback: types.CallbackQuery):
     except Exception as e:
         logger.error(f"Server info error: {e}")
         await callback.message.edit_text("❌ Error fetching server information.")
-
-# --- BOT MANAGER PLACEHOLDER ---
-
-
 
 # --- SERVER SETTINGS ---
 
