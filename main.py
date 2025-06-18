@@ -18,6 +18,7 @@ from bson.objectid import ObjectId
 from bson.errors import InvalidId
 from file_manager import init_file_manager
 from bot_manager import init_bot_manager
+from deployment import init_deployment
 from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -259,9 +260,10 @@ async def on_startup(_):
     except Exception as e:
         logger.error(f"Startup error: {e}")
     
-    # Initialize file manager and bot manager
+    # Initialize all modules
     init_file_manager(dp, bot, active_sessions, user_input)
     init_bot_manager(dp, bot, active_sessions, user_input)
+    init_deployment(dp, bot, active_sessions, user_input)
     logger.info("✅ Bot startup complete")
 
 # --- MAIN HANDLERS ---
@@ -492,9 +494,12 @@ async def view_server(callback: types.CallbackQuery):
         )
         kb.add(
             InlineKeyboardButton("🤖 Bot Manager", callback_data=f"bot_manager_{server_id}"),
-            InlineKeyboardButton("⚙️ Settings", callback_data=f"edit_{server_id}")
+            InlineKeyboardButton("🚀 Deployment", callback_data=f"deploy_bot_{server_id}")
         )
-        kb.add(InlineKeyboardButton("⬅️ Back to Servers", callback_data="start"))
+        kb.add(
+            InlineKeyboardButton("⚙️ Settings", callback_data=f"edit_{server_id}"),
+            InlineKeyboardButton("⬅️ Back to Servers", callback_data="start")
+        )
         
         text = (
             f"🖥 <b>{server['name']}</b>\n\n"
