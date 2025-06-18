@@ -185,3 +185,11 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             ssh = await get_ssh_session(server_id)
             if not ssh:
                 return None
+
+            # You probably intended to continue logic here
+            # For now, let's simulate with a placeholder
+            return {"id": bot_id, "status": "running"}
+
+        except Exception as e:
+            logger.error(f"Error getting bot details for {bot_id}: {e}")
+            return None
