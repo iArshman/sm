@@ -320,7 +320,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             kb = InlineKeyboardMarkup(row_width=2)
             
             # Check if it's an archive file
-            is_archive = file_name.lower().endswith(('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz'))
+            is_archive = file_name.lower().endswith(('.zip', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tar.xz', '.rar', '.7z'))
             
             if is_archive:
                 kb.add(
@@ -774,7 +774,16 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             
             await bot.send_message(
                 user_id,
-                "📤 <b>Upload File</b>\n\nSend any file you want to upload to the server:",
+                "📤 <b>Upload File</b>\n\n"
+                "Send any file you want to upload to the server:\n\n"
+                "📋 <b>Supported types:</b>\n"
+                "• Documents (PDF, DOC, TXT, etc.)\n"
+                "• Images (JPG, PNG, GIF, etc.)\n"
+                "• Videos (MP4, AVI, MOV, etc.)\n"
+                "• Audio (MP3, WAV, OGG, etc.)\n"
+                "• Archives (ZIP, RAR, TAR, etc.)\n"
+                "• Any other file type\n\n"
+                "📏 <b>Max size:</b> 50MB",
                 parse_mode='HTML',
                 reply_markup=kb
             )
@@ -827,7 +836,16 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             await message.answer("❌ Error processing input.")
 
     # --- HANDLE FILE UPLOADS ---
-    @dp.message_handler(content_types=[types.ContentType.DOCUMENT, types.ContentType.PHOTO, types.ContentType.VIDEO, types.ContentType.AUDIO, types.ContentType.VOICE, types.ContentType.VIDEO_NOTE, types.ContentType.STICKER])
+    @dp.message_handler(content_types=[
+        types.ContentType.DOCUMENT, 
+        types.ContentType.PHOTO, 
+        types.ContentType.VIDEO, 
+        types.ContentType.AUDIO, 
+        types.ContentType.VOICE, 
+        types.ContentType.VIDEO_NOTE, 
+        types.ContentType.STICKER,
+        types.ContentType.ANIMATION
+    ])
     async def handle_file_upload(message: types.Message):
         try:
             user_id = message.from_user.id
@@ -848,29 +866,32 @@ def init_file_manager(dp, bot, active_sessions, user_input):
                 filename = message.document.file_name or f"document_{message.document.file_id}"
             elif message.photo:
                 file_obj = message.photo[-1]  # Get highest resolution
-                filename = f"photo_{message.photo[-1].file_id}.jpg"
+                filename = f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             elif message.video:
                 file_obj = message.video
-                filename = message.video.file_name or f"video_{message.video.file_id}.mp4"
+                filename = message.video.file_name or f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
             elif message.audio:
                 file_obj = message.audio
-                filename = message.audio.file_name or f"audio_{message.audio.file_id}.mp3"
+                filename = message.audio.file_name or f"audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp3"
             elif message.voice:
                 file_obj = message.voice
-                filename = f"voice_{message.voice.file_id}.ogg"
+                filename = f"voice_{datetime.now().strftime('%Y%m%d_%H%M%S')}.ogg"
             elif message.video_note:
                 file_obj = message.video_note
-                filename = f"video_note_{message.video_note.file_id}.mp4"
+                filename = f"video_note_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
             elif message.sticker:
                 file_obj = message.sticker
-                filename = f"sticker_{message.sticker.file_id}.webp"
+                filename = f"sticker_{datetime.now().strftime('%Y%m%d_%H%M%S')}.webp"
+            elif message.animation:
+                file_obj = message.animation
+                filename = message.animation.file_name or f"animation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.gif"
             
             if not file_obj:
                 await message.answer("❌ Unsupported file type.")
                 return
             
             # Check file size
-            if hasattr(file_obj, 'file_size') and file_obj.file_size > 50 * 1024 * 1024:
+            if hasattr(file_obj, 'file_size') and file_obj.file_size and file_obj.file_size > 50 * 1024 * 1024:
                 await message.answer("❌ File too large (>50MB).")
                 return
             
@@ -1082,17 +1103,24 @@ async def create_zip_on_server(server_id, path, filenames, zip_name, active_sess
         
         ssh = active_sessions[server_id]
         
-        # Create list of files to zip
-        files_str = ' '.join([f"'{f}'" for f in filenames])
-        zip_path = os.path.join(path, zip_name).replace('\\', '/')
+        # Check if zip is installed
+        stdin, stdout, stderr = ssh.exec_command("which zip")
+        if not stdout.read().decode().strip():
+            # Try with tar if zip is not available
+            files_str = ' '.join([f"'{f}'" for f in filenames])
+            tar_name = zip_name.replace('.zip', '.tar.gz')
+            command = f"cd '{path}' && tar -czf '{tar_name}' {files_str}"
+        else:
+            # Use zip
+            files_str = ' '.join([f"'{f}'" for f in filenames])
+            command = f"cd '{path}' && zip -r '{zip_name}' {files_str}"
         
-        command = f"cd '{path}' && zip -r '{zip_name}' {files_str}"
         stdin, stdout, stderr = ssh.exec_command(command)
         stdout_output = stdout.read().decode()
         error = stderr.read().decode().strip()
         
-        # Check if zip command succeeded
-        if "adding:" in stdout_output or not error:
+        # Check if command succeeded
+        if not error or "adding:" in stdout_output or "deflated" in stdout_output:
             return True
         
         logger.error(f"Zip creation error: {error}")
@@ -1119,17 +1147,45 @@ async def extract_archive_on_server(server_id, path, archive_filename, active_se
         
         extract_path = os.path.join(path, extract_dir).replace('\\', '/')
         
+        # Create extraction directory
+        stdin, stdout, stderr = ssh.exec_command(f"mkdir -p '{extract_path}'")
+        
         # Determine archive type and extract
         if archive_filename.lower().endswith('.zip'):
-            command = f"cd '{path}' && mkdir -p '{extract_dir}' && unzip '{archive_filename}' -d '{extract_dir}'"
+            # Check if unzip is available
+            stdin, stdout, stderr = ssh.exec_command("which unzip")
+            if stdout.read().decode().strip():
+                command = f"cd '{extract_path}' && unzip '{archive_path}'"
+            else:
+                return False
+                
         elif archive_filename.lower().endswith(('.tar.gz', '.tgz')):
-            command = f"cd '{path}' && mkdir -p '{extract_dir}' && tar -xzf '{archive_filename}' -C '{extract_dir}'"
+            command = f"cd '{extract_path}' && tar -xzf '{archive_path}'"
+            
         elif archive_filename.lower().endswith(('.tar.bz2', '.tbz2')):
-            command = f"cd '{path}' && mkdir -p '{extract_dir}' && tar -xjf '{archive_filename}' -C '{extract_dir}'"
+            command = f"cd '{extract_path}' && tar -xjf '{archive_path}'"
+            
         elif archive_filename.lower().endswith(('.tar.xz', '.txz')):
-            command = f"cd '{path}' && mkdir -p '{extract_dir}' && tar -xJf '{archive_filename}' -C '{extract_dir}'"
+            command = f"cd '{extract_path}' && tar -xJf '{archive_path}'"
+            
         elif archive_filename.lower().endswith('.tar'):
-            command = f"cd '{path}' && mkdir -p '{extract_dir}' && tar -xf '{archive_filename}' -C '{extract_dir}'"
+            command = f"cd '{extract_path}' && tar -xf '{archive_path}'"
+            
+        elif archive_filename.lower().endswith('.rar'):
+            # Check if unrar is available
+            stdin, stdout, stderr = ssh.exec_command("which unrar")
+            if stdout.read().decode().strip():
+                command = f"cd '{extract_path}' && unrar x '{archive_path}'"
+            else:
+                return False
+                
+        elif archive_filename.lower().endswith('.7z'):
+            # Check if 7z is available
+            stdin, stdout, stderr = ssh.exec_command("which 7z")
+            if stdout.read().decode().strip():
+                command = f"cd '{extract_path}' && 7z x '{archive_path}'"
+            else:
+                return False
         else:
             return False
         
@@ -1138,7 +1194,7 @@ async def extract_archive_on_server(server_id, path, archive_filename, active_se
         error = stderr.read().decode().strip()
         
         # Check if extraction succeeded
-        if not error or "inflating:" in stdout_output or "extracting:" in stdout_output:
+        if not error or "inflating:" in stdout_output or "extracting:" in stdout_output or "x " in stdout_output:
             return True
         
         logger.error(f"Extract error: {error}")
