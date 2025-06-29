@@ -6,6 +6,7 @@ import zipfile
 import tarfile
 import asyncio
 import re
+import hashlib
 from datetime import datetime
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,6 +15,24 @@ logger = logging.getLogger(__name__)
 
 # Deployment state
 deployment_states = {}
+callback_cache = {}  # Cache for long callback data
+
+def get_callback_hash(data):
+    """Generate short hash for long callback data"""
+    return hashlib.md5(data.encode()).hexdigest()[:8]
+
+def cache_callback_data(data):
+    """Cache callback data and return hash if too long"""
+    if len(data) <= 60:  # Safe length for callback data
+        return data
+    
+    callback_hash = get_callback_hash(data)
+    callback_cache[callback_hash] = data
+    return callback_hash
+
+def get_cached_callback_data(identifier):
+    """Get callback data from cache or return identifier if not cached"""
+    return callback_cache.get(identifier, identifier)
 
 def init_deployment(dp, bot, active_sessions, user_input):
     """Initialize deployment handlers"""
@@ -22,33 +41,32 @@ def init_deployment(dp, bot, active_sessions, user_input):
     
     async def get_ssh_session(server_id):
         """Get SSH session for server"""
-        from db import get_server_by_id
-        
-        server = await get_server_by_id(server_id)
-        if not server:
-            return None
-        
-        # Use the session from active_sessions if available
         if server_id in active_sessions:
             return active_sessions[server_id]
-        
         return None
     
     # --- DEPLOYMENT MAIN HANDLER ---
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_") or get_cached_callback_data(c.data).startswith("deploy_"))
     async def deploy_handler(callback: types.CallbackQuery):
         """Main deployment menu"""
         try:
-            server_id = callback.data.split('_')[1]
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            server_id = callback_data.split('_')[1]
+            
+            github_callback = cache_callback_data(f"deploy_github_{server_id}")
+            docker_callback = cache_callback_data(f"deploy_docker_{server_id}")
+            upload_callback = cache_callback_data(f"deploy_upload_{server_id}")
+            back_callback = cache_callback_data(f"server_{server_id}")
             
             kb = InlineKeyboardMarkup(row_width=1)
             kb.add(
-                InlineKeyboardButton("🐙 Deploy from GitHub", callback_data=f"deploy_github_{server_id}"),
-                InlineKeyboardButton("🐳 Deploy with Docker", callback_data=f"deploy_docker_{server_id}"),
-                InlineKeyboardButton("📦 Upload & Deploy", callback_data=f"deploy_upload_{server_id}")
+                InlineKeyboardButton("🐙 Deploy from GitHub", callback_data=github_callback),
+                InlineKeyboardButton("🐳 Deploy with Docker", callback_data=docker_callback),
+                InlineKeyboardButton("📦 Upload & Deploy", callback_data=upload_callback)
             )
-            kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=f"server_{server_id}"))
+            kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=back_callback))
             
             await callback.message.edit_text(
                 "🚀 <b>Deployment Center</b>\n\n"
@@ -63,11 +81,13 @@ def init_deployment(dp, bot, active_sessions, user_input):
     
     # --- GITHUB DEPLOYMENT ---
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_github_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_github_") or get_cached_callback_data(c.data).startswith("deploy_github_"))
     async def deploy_github_handler(callback: types.CallbackQuery):
         """Start GitHub deployment"""
         try:
-            server_id = callback.data.split('_')[2]
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            server_id = callback_data.split('_')[2]
             
             deployment_states[callback.from_user.id] = {
                 'type': 'github',
@@ -75,8 +95,9 @@ def init_deployment(dp, bot, active_sessions, user_input):
                 'step': 'repo_url'
             }
             
+            cancel_callback = cache_callback_data(f"deploy_{server_id}")
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"deploy_{server_id}"))
+            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback))
             
             await bot.send_message(
                 callback.from_user.id,
@@ -97,11 +118,13 @@ def init_deployment(dp, bot, active_sessions, user_input):
     
     # --- DOCKER DEPLOYMENT ---
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_docker_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_docker_") or get_cached_callback_data(c.data).startswith("deploy_docker_"))
     async def deploy_docker_handler(callback: types.CallbackQuery):
         """Start Docker deployment"""
         try:
-            server_id = callback.data.split('_')[2]
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            server_id = callback_data.split('_')[2]
             
             deployment_states[callback.from_user.id] = {
                 'type': 'docker',
@@ -109,8 +132,9 @@ def init_deployment(dp, bot, active_sessions, user_input):
                 'step': 'image_or_repo'
             }
             
+            cancel_callback = cache_callback_data(f"deploy_{server_id}")
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"deploy_{server_id}"))
+            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback))
             
             await bot.send_message(
                 callback.from_user.id,
@@ -133,11 +157,13 @@ def init_deployment(dp, bot, active_sessions, user_input):
     
     # --- UPLOAD DEPLOYMENT ---
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_upload_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("deploy_upload_") or get_cached_callback_data(c.data).startswith("deploy_upload_"))
     async def deploy_upload_handler(callback: types.CallbackQuery):
         """Start upload deployment"""
         try:
-            server_id = callback.data.split('_')[2]
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            server_id = callback_data.split('_')[2]
             
             deployment_states[callback.from_user.id] = {
                 'type': 'upload',
@@ -145,8 +171,9 @@ def init_deployment(dp, bot, active_sessions, user_input):
                 'step': 'file_upload'
             }
             
+            cancel_callback = cache_callback_data(f"deploy_{server_id}")
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"deploy_{server_id}"))
+            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback))
             
             await bot.send_message(
                 callback.from_user.id,
@@ -516,18 +543,24 @@ def init_deployment(dp, bot, active_sessions, user_input):
             # Create deployment options
             kb = InlineKeyboardMarkup(row_width=2)
             
+            install_callback = cache_callback_data(f"install_deps_{uid}")
+            docker_callback = cache_callback_data(f"docker_deploy_{uid}")
+            service_callback = cache_callback_data(f"configure_service_{uid}")
+            manual_callback = cache_callback_data(f"manual_setup_{uid}")
+            cancel_callback = cache_callback_data(f"cancel_deploy_{uid}")
+            
             if project_info['dependencies']:
-                kb.add(InlineKeyboardButton("📦 Install Dependencies", callback_data=f"install_deps_{uid}"))
+                kb.add(InlineKeyboardButton("📦 Install Dependencies", callback_data=install_callback))
             
             if project_info['has_dockerfile']:
-                kb.add(InlineKeyboardButton("🐳 Docker Deploy", callback_data=f"docker_deploy_{uid}"))
+                kb.add(InlineKeyboardButton("🐳 Docker Deploy", callback_data=docker_callback))
             
             if project_info['type'] != 'unknown':
-                kb.add(InlineKeyboardButton("🔧 Configure Service", callback_data=f"configure_service_{uid}"))
+                kb.add(InlineKeyboardButton("🔧 Configure Service", callback_data=service_callback))
             
             kb.add(
-                InlineKeyboardButton("⚙️ Manual Setup", callback_data=f"manual_setup_{uid}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_deploy_{uid}")
+                InlineKeyboardButton("⚙️ Manual Setup", callback_data=manual_callback),
+                InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback)
             )
             
             await message.answer(detection_text, parse_mode='HTML', reply_markup=kb)
@@ -539,12 +572,16 @@ def init_deployment(dp, bot, active_sessions, user_input):
     async def show_docker_options(message, uid, state):
         """Show Docker deployment options"""
         try:
+            configure_callback = cache_callback_data(f"docker_configure_{uid}")
+            deploy_callback = cache_callback_data(f"docker_deploy_now_{uid}")
+            cancel_callback = cache_callback_data(f"cancel_deploy_{uid}")
+            
             kb = InlineKeyboardMarkup(row_width=2)
             kb.add(
-                InlineKeyboardButton("🔧 Configure", callback_data=f"docker_configure_{uid}"),
-                InlineKeyboardButton("🚀 Deploy Now", callback_data=f"docker_deploy_now_{uid}")
+                InlineKeyboardButton("🔧 Configure", callback_data=configure_callback),
+                InlineKeyboardButton("🚀 Deploy Now", callback_data=deploy_callback)
             )
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_deploy_{uid}"))
+            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback))
             
             if state['docker_type'] == 'build':
                 text = (
@@ -568,11 +605,14 @@ def init_deployment(dp, bot, active_sessions, user_input):
     
     # --- DEPLOYMENT CALLBACK HANDLERS ---
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("install_deps_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("install_deps_") or get_cached_callback_data(c.data).startswith("install_deps_"))
     async def install_deps_handler(callback: types.CallbackQuery):
         """Install project dependencies"""
         try:
-            uid = int(callback.data.split('_')[2])
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            uid = int(callback_data.split('_')[2])
+            
             if uid not in deployment_states:
                 await callback.message.edit_text("❌ Deployment session expired")
                 return
@@ -627,12 +667,16 @@ def init_deployment(dp, bot, active_sessions, user_input):
             result_text += "\n".join(install_log)
             result_text += f"\n\n{'✅ All dependencies installed successfully!' if success else '❌ Some dependencies failed to install'}"
             
+            service_callback = cache_callback_data(f"configure_service_{uid}")
+            manual_callback = cache_callback_data(f"manual_setup_{uid}")
+            cancel_callback = cache_callback_data(f"cancel_deploy_{uid}")
+            
             kb = InlineKeyboardMarkup(row_width=2)
             if success:
-                kb.add(InlineKeyboardButton("🔧 Configure Service", callback_data=f"configure_service_{uid}"))
+                kb.add(InlineKeyboardButton("🔧 Configure Service", callback_data=service_callback))
             kb.add(
-                InlineKeyboardButton("⚙️ Manual Setup", callback_data=f"manual_setup_{uid}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_deploy_{uid}")
+                InlineKeyboardButton("⚙️ Manual Setup", callback_data=manual_callback),
+                InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback)
             )
             
             await callback.message.edit_text(result_text, parse_mode='HTML', reply_markup=kb)
@@ -641,11 +685,14 @@ def init_deployment(dp, bot, active_sessions, user_input):
             logger.error(f"Install deps error: {e}")
             await callback.message.edit_text("❌ Error installing dependencies")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("configure_service_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("configure_service_") or get_cached_callback_data(c.data).startswith("configure_service_"))
     async def configure_service_handler(callback: types.CallbackQuery):
         """Configure systemd service"""
         try:
-            uid = int(callback.data.split('_')[2])
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            uid = int(callback_data.split('_')[2])
+            
             if uid not in deployment_states:
                 await callback.message.edit_text("❌ Deployment session expired")
                 return
@@ -715,17 +762,32 @@ WantedBy=multi-user.target
             if success:
                 result_text += "🎉 <b>Deployment completed successfully!</b>\n"
                 result_text += f"Your application is now running on port {project_info['suggested_port']}"
+                
+                # Add to bot manager
+                from bot_manager import add_managed_bot
+                bot_info = {
+                    'id': f"systemd_{deploy_name}",
+                    'name': deploy_name,
+                    'type': 'systemd',
+                    'status': 'running'
+                }
+                add_managed_bot(state['server_id'], bot_info)
+                
             else:
                 result_text += "❌ <b>Service failed to start</b>\n"
                 result_text += "Check the logs for more information."
             
+            logs_callback = cache_callback_data(f"view_logs_{uid}")
+            restart_callback = cache_callback_data(f"restart_service_{uid}")
+            complete_callback = cache_callback_data(f"deployment_complete_{uid}")
+            
             kb = InlineKeyboardMarkup(row_width=2)
             if success:
                 kb.add(
-                    InlineKeyboardButton("📊 View Logs", callback_data=f"view_logs_{uid}"),
-                    InlineKeyboardButton("🔄 Restart", callback_data=f"restart_service_{uid}")
+                    InlineKeyboardButton("📊 View Logs", callback_data=logs_callback),
+                    InlineKeyboardButton("🔄 Restart", callback_data=restart_callback)
                 )
-            kb.add(InlineKeyboardButton("✅ Done", callback_data=f"deployment_complete_{uid}"))
+            kb.add(InlineKeyboardButton("✅ Done", callback_data=complete_callback))
             
             await callback.message.edit_text(result_text, parse_mode='HTML', reply_markup=kb)
             
@@ -733,11 +795,14 @@ WantedBy=multi-user.target
             logger.error(f"Configure service error: {e}")
             await callback.message.edit_text("❌ Error configuring service")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("docker_deploy_now_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("docker_deploy_now_") or get_cached_callback_data(c.data).startswith("docker_deploy_now_"))
     async def docker_deploy_now_handler(callback: types.CallbackQuery):
         """Deploy Docker container immediately"""
         try:
-            uid = int(callback.data.split('_')[3])
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            uid = int(callback_data.split('_')[3])
+            
             if uid not in deployment_states:
                 await callback.message.edit_text("❌ Deployment session expired")
                 return
@@ -808,11 +873,23 @@ WantedBy=multi-user.target
             if success:
                 result_text += "🎉 <b>Docker deployment completed successfully!</b>\n"
                 result_text += "Your container is now running on port 3000"
+                
+                # Add to bot manager
+                from bot_manager import add_managed_bot
+                bot_info = {
+                    'id': f"docker_{container_name}",
+                    'name': container_name,
+                    'type': 'docker',
+                    'status': 'running'
+                }
+                add_managed_bot(state['server_id'], bot_info)
+                
             else:
                 result_text += "❌ <b>Container failed to start</b>"
             
+            complete_callback = cache_callback_data(f"deployment_complete_{uid}")
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("✅ Done", callback_data=f"deployment_complete_{uid}"))
+            kb.add(InlineKeyboardButton("✅ Done", callback_data=complete_callback))
             
             await callback.message.edit_text(result_text, parse_mode='HTML', reply_markup=kb)
             
@@ -820,11 +897,14 @@ WantedBy=multi-user.target
             logger.error(f"Docker deploy now error: {e}")
             await callback.message.edit_text("❌ Error deploying Docker container")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("manual_setup_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("manual_setup_") or get_cached_callback_data(c.data).startswith("manual_setup_"))
     async def manual_setup_handler(callback: types.CallbackQuery):
         """Show manual setup instructions"""
         try:
-            uid = int(callback.data.split('_')[2])
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            uid = int(callback_data.split('_')[2])
+            
             if uid not in deployment_states:
                 await callback.message.edit_text("❌ Deployment session expired")
                 return
@@ -871,8 +951,9 @@ WantedBy=multi-user.target
             instructions += "• Create a systemd service for auto-start\n"
             instructions += "• Configure firewall rules for the port\n"
             
+            complete_callback = cache_callback_data(f"deployment_complete_{uid}")
             kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("✅ Done", callback_data=f"deployment_complete_{uid}"))
+            kb.add(InlineKeyboardButton("✅ Done", callback_data=complete_callback))
             
             await callback.message.edit_text(instructions, parse_mode='HTML', reply_markup=kb)
             
@@ -880,11 +961,14 @@ WantedBy=multi-user.target
             logger.error(f"Manual setup error: {e}")
             await callback.message.edit_text("❌ Error showing manual setup")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("view_logs_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("view_logs_") or get_cached_callback_data(c.data).startswith("view_logs_"))
     async def view_logs_handler(callback: types.CallbackQuery):
         """View service logs"""
         try:
-            uid = int(callback.data.split('_')[2])
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            uid = int(callback_data.split('_')[2])
+            
             if uid not in deployment_states:
                 await callback.message.edit_text("❌ Deployment session expired")
                 return
@@ -903,11 +987,13 @@ WantedBy=multi-user.target
             if not logs:
                 logs = "No logs available"
             
+            back_callback = cache_callback_data(f"configure_service_{uid}")
+            
             await callback.message.edit_text(
                 f"📊 <b>Service Logs</b>\n\n<code>{logs}</code>",
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("⬅️ Back", callback_data=f"configure_service_{uid}")
+                    InlineKeyboardButton("⬅️ Back", callback_data=back_callback)
                 )
             )
             
@@ -915,16 +1001,21 @@ WantedBy=multi-user.target
             logger.error(f"View logs error: {e}")
             await callback.message.edit_text("❌ Error viewing logs")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("deployment_complete_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("deployment_complete_") or get_cached_callback_data(c.data).startswith("deployment_complete_"))
     async def deployment_complete_handler(callback: types.CallbackQuery):
         """Complete deployment"""
         try:
-            uid = int(callback.data.split('_')[2])
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            uid = int(callback_data.split('_')[2])
+            
             if uid in deployment_states:
                 server_id = deployment_states[uid]['server_id']
                 deployment_states.pop(uid, None)
             else:
                 server_id = "unknown"
+            
+            server_callback = cache_callback_data(f"server_{server_id}")
             
             await callback.message.edit_text(
                 "✅ <b>Deployment Complete!</b>\n\n"
@@ -932,7 +1023,7 @@ WantedBy=multi-user.target
                 "You can now manage it through the Bot Manager or manually via SSH.",
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("🖥️ Back to Server", callback_data=f"server_{server_id}")
+                    InlineKeyboardButton("🖥️ Back to Server", callback_data=server_callback)
                 )
             )
             
@@ -940,23 +1031,28 @@ WantedBy=multi-user.target
             logger.error(f"Deployment complete error: {e}")
             await callback.message.edit_text("✅ Deployment completed")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("cancel_deploy_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("cancel_deploy_") or get_cached_callback_data(c.data).startswith("cancel_deploy_"))
     async def cancel_deploy_handler(callback: types.CallbackQuery):
         """Cancel deployment"""
         try:
-            uid = int(callback.data.split('_')[2])
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            uid = int(callback_data.split('_')[2])
+            
             if uid in deployment_states:
                 server_id = deployment_states[uid]['server_id']
                 deployment_states.pop(uid, None)
             else:
                 server_id = "unknown"
             
+            server_callback = cache_callback_data(f"server_{server_id}")
+            
             await callback.message.edit_text(
                 "❌ <b>Deployment Cancelled</b>\n\n"
                 "The deployment process has been cancelled.",
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("🖥️ Back to Server", callback_data=f"server_{server_id}")
+                    InlineKeyboardButton("🖥️ Back to Server", callback_data=server_callback)
                 )
             )
             
