@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import hashlib
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -7,6 +8,24 @@ logger = logging.getLogger(__name__)
 
 # Bot management state
 managed_bots = {}  # Store manually added bots: {server_id: [bot_list]}
+callback_cache = {}  # Cache for long callback data: {hash: data}
+
+def get_callback_hash(data):
+    """Generate short hash for long callback data"""
+    return hashlib.md5(data.encode()).hexdigest()[:8]
+
+def cache_callback_data(data):
+    """Cache callback data and return hash if too long"""
+    if len(data) <= 60:  # Safe length for callback data
+        return data
+    
+    callback_hash = get_callback_hash(data)
+    callback_cache[callback_hash] = data
+    return callback_hash
+
+def get_cached_callback_data(identifier):
+    """Get callback data from cache or return identifier if not cached"""
+    return callback_cache.get(identifier, identifier)
 
 def init_bot_manager(dp, bot, active_sessions, user_input):
     """Initialize bot manager handlers"""
@@ -19,15 +38,17 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
         
         for bot_info in bots:
             status_icon = "🟢" if bot_info['status'] == 'running' else "🔴"
+            callback_data = cache_callback_data(f"bot_detail_{server_id}_{bot_info['id']}")
             kb.add(InlineKeyboardButton(
                 f"{status_icon} {bot_info['name']} ({bot_info['type']})",
-                callback_data=f"bot_detail_{server_id}_{bot_info['id']}"
+                callback_data=callback_data
             ))
         
-        kb.add(
-            InlineKeyboardButton("➕ Add Bot", callback_data=f"add_bot_menu_{server_id}")       
-        )
-        kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=f"server_{server_id}"))
+        add_callback = cache_callback_data(f"add_bot_menu_{server_id}")
+        back_callback = cache_callback_data(f"server_{server_id}")
+        
+        kb.add(InlineKeyboardButton("➕ Add Bot", callback_data=add_callback))
+        kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=back_callback))
         
         return kb
     
@@ -35,24 +56,33 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
         """Create keyboard for individual bot management"""
         kb = InlineKeyboardMarkup(row_width=2)
         
+        start_callback = cache_callback_data(f"bot_start_{server_id}_{bot_id}")
+        stop_callback = cache_callback_data(f"bot_stop_{server_id}_{bot_id}")
+        restart_callback = cache_callback_data(f"bot_restart_{server_id}_{bot_id}")
+        
         if bot_status == 'running':
             kb.add(
-                InlineKeyboardButton("⏹️ Stop", callback_data=f"bot_stop_{server_id}_{bot_id}"),
-                InlineKeyboardButton("🔄 Restart", callback_data=f"bot_restart_{server_id}_{bot_id}")
+                InlineKeyboardButton("⏹️ Stop", callback_data=stop_callback),
+                InlineKeyboardButton("🔄 Restart", callback_data=restart_callback)
             )
         else:
             kb.add(
-                InlineKeyboardButton("▶️ Start", callback_data=f"bot_start_{server_id}_{bot_id}"),
-                InlineKeyboardButton("🔄 Restart", callback_data=f"bot_restart_{server_id}_{bot_id}")
+                InlineKeyboardButton("▶️ Start", callback_data=start_callback),
+                InlineKeyboardButton("🔄 Restart", callback_data=restart_callback)
             )
         
+        logs_callback = cache_callback_data(f"bot_logs_{server_id}_{bot_id}")
+        settings_callback = cache_callback_data(f"bot_settings_{server_id}_{bot_id}")
+        remove_callback = cache_callback_data(f"bot_remove_{server_id}_{bot_id}")
+        back_callback = cache_callback_data(f"bot_manager_{server_id}")
+        
         kb.add(
-            InlineKeyboardButton("📊 Logs", callback_data=f"bot_logs_{server_id}_{bot_id}"),
-            InlineKeyboardButton("⚙️ Settings", callback_data=f"bot_settings_{server_id}_{bot_id}")
+            InlineKeyboardButton("📊 Logs", callback_data=logs_callback),
+            InlineKeyboardButton("⚙️ Settings", callback_data=settings_callback)
         )
         kb.add(
-            InlineKeyboardButton("🗑️ Remove", callback_data=f"bot_remove_{server_id}_{bot_id}"),
-            InlineKeyboardButton("⬅️ Back to Bots", callback_data=f"bot_manager_{server_id}")
+            InlineKeyboardButton("🗑️ Remove", callback_data=remove_callback),
+            InlineKeyboardButton("⬅️ Back to Bots", callback_data=back_callback)
         )
         
         return kb
@@ -317,11 +347,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
     
     # --- CALLBACK HANDLERS ---
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("bot_manager_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_manager_") or get_cached_callback_data(c.data).startswith("bot_manager_"))
     async def bot_manager_menu(callback: types.CallbackQuery):
         """Show bot manager main menu"""
         try:
-            server_id = callback.data.split('_')[2]
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            server_id = callback_data.split('_')[2]
             
             from db import get_server_by_id
             server = await get_server_by_id(server_id)
@@ -334,9 +366,12 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             bots = get_managed_bots(server_id)
             
             if not bots:
+                add_callback = cache_callback_data(f"add_bot_menu_{server_id}")
+                back_callback = cache_callback_data(f"server_{server_id}")
+                
                 kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("➕ Add Bot", callback_data=f"add_bot_menu_{server_id}"))
-                kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=f"server_{server_id}"))
+                kb.add(InlineKeyboardButton("➕ Add Bot", callback_data=add_callback))
+                kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=back_callback))
                 
                 await callback.message.edit_text(
                     f"🤖 <b>Bot Manager</b>\n\n"
@@ -368,22 +403,30 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Bot manager menu error: {e}")
             await callback.message.edit_text("❌ Error loading bot manager.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("add_bot_menu_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("add_bot_menu_") or get_cached_callback_data(c.data).startswith("add_bot_menu_"))
     async def add_bot_menu(callback: types.CallbackQuery):
         """Show add bot menu"""
         try:
-            server_id = callback.data.split('_')[3]
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            server_id = callback_data.split('_')[3]
+            
+            systemd_callback = cache_callback_data(f"discover_systemd_{server_id}")
+            docker_callback = cache_callback_data(f"discover_docker_{server_id}")
+            pm2_callback = cache_callback_data(f"discover_pm2_{server_id}")
+            processes_callback = cache_callback_data(f"discover_processes_{server_id}")
+            back_callback = cache_callback_data(f"bot_manager_{server_id}")
             
             kb = InlineKeyboardMarkup(row_width=2)
             kb.add(
-                InlineKeyboardButton("🔧 Systemd Services", callback_data=f"discover_systemd_{server_id}"),
-                InlineKeyboardButton("🐳 Docker Containers", callback_data=f"discover_docker_{server_id}")
+                InlineKeyboardButton("🔧 Systemd Services", callback_data=systemd_callback),
+                InlineKeyboardButton("🐳 Docker Containers", callback_data=docker_callback)
             )
             kb.add(
-                InlineKeyboardButton("📦 PM2 Processes", callback_data=f"discover_pm2_{server_id}"),
-                InlineKeyboardButton("⚙️ Running Processes", callback_data=f"discover_processes_{server_id}")
+                InlineKeyboardButton("📦 PM2 Processes", callback_data=pm2_callback),
+                InlineKeyboardButton("⚙️ Running Processes", callback_data=processes_callback)
             )
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_manager_{server_id}"))
+            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=back_callback))
             
             await callback.message.edit_text(
                 "➕ <b>Add Bot</b>\n\n"
@@ -396,11 +439,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Add bot menu error: {e}")
             await callback.message.edit_text("❌ Error loading add bot menu.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("discover_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("discover_") or get_cached_callback_data(c.data).startswith("discover_"))
     async def discover_services_handler(callback: types.CallbackQuery):
         """Discover and show services"""
         try:
-            parts = callback.data.split('_')
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_')
             service_type = parts[1]
             server_id = parts[2]
             
@@ -409,8 +454,9 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             services = await discover_services(server_id, service_type)
             
             if not services:
+                back_callback = cache_callback_data(f"add_bot_menu_{server_id}")
                 kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"add_bot_menu_{server_id}"))
+                kb.add(InlineKeyboardButton("⬅️ Back", callback_data=back_callback))
                 
                 await callback.message.edit_text(
                     f"❌ <b>No {service_type} services found</b>\n\n"
@@ -427,12 +473,14 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                 status_icon = "🟢" if service['status'] == 'running' else "🔴"
                 display_name = service['name'][:30] + "..." if len(service['name']) > 30 else service['name']
                 
+                select_callback = cache_callback_data(f"select_service_{server_id}_{service_type}_{service['name']}")
                 kb.add(InlineKeyboardButton(
                     f"{status_icon} {display_name}",
-                    callback_data=f"select_service_{server_id}_{service_type}_{service['name']}"
+                    callback_data=select_callback
                 ))
             
-            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"add_bot_menu_{server_id}"))
+            back_callback = cache_callback_data(f"add_bot_menu_{server_id}")
+            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=back_callback))
             
             await callback.message.edit_text(
                 f"🔍 <b>Found {len(services)} {service_type} service(s)</b>\n\n"
@@ -445,11 +493,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Discover services error: {e}")
             await callback.message.edit_text("❌ Error discovering services.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("select_service_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("select_service_") or get_cached_callback_data(c.data).startswith("select_service_"))
     async def select_service_handler(callback: types.CallbackQuery):
         """Handle service selection"""
         try:
-            parts = callback.data.split('_', 4)
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_', 4)
             server_id = parts[2]
             service_type = parts[3]
             service_name = parts[4]
@@ -474,14 +524,24 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                 
                 # Return to bot manager after 2 seconds
                 await asyncio.sleep(2)
-                await bot_manager_menu(callback)
+                
+                # Create new callback for bot manager
+                new_callback = types.CallbackQuery(
+                    id=callback.id,
+                    from_user=callback.from_user,
+                    message=callback.message,
+                    data=f"bot_manager_{server_id}",
+                    chat_instance=callback.chat_instance
+                )
+                await bot_manager_menu(new_callback)
             else:
+                back_callback = cache_callback_data(f"bot_manager_{server_id}")
                 await callback.message.edit_text(
                     "❌ <b>Bot Already Exists</b>\n\n"
                     "This service is already being managed.",
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Back", callback_data=f"bot_manager_{server_id}")
+                        InlineKeyboardButton("⬅️ Back", callback_data=back_callback)
                     )
                 )
             
@@ -489,11 +549,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Select service error: {e}")
             await callback.message.edit_text("❌ Error adding service.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("bot_detail_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_detail_") or get_cached_callback_data(c.data).startswith("bot_detail_"))
     async def bot_detail_menu(callback: types.CallbackQuery):
         """Show individual bot detail menu"""
         try:
-            parts = callback.data.split('_')
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_')
             server_id = parts[2]
             bot_id = '_'.join(parts[3:])
             
@@ -502,10 +564,11 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             bot_details = await get_bot_details(server_id, bot_id)
             
             if not bot_details:
+                back_callback = cache_callback_data(f"bot_manager_{server_id}")
                 await callback.message.edit_text(
                     "❌ Bot not found or error loading details.",
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Back to Bots", callback_data=f"bot_manager_{server_id}")
+                        InlineKeyboardButton("⬅️ Back to Bots", callback_data=back_callback)
                     )
                 )
                 return
@@ -528,11 +591,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Bot detail error: {e}")
             await callback.message.edit_text("❌ Error loading bot details.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("bot_start_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_start_") or get_cached_callback_data(c.data).startswith("bot_start_"))
     async def bot_start(callback: types.CallbackQuery):
         """Start a bot"""
         try:
-            parts = callback.data.split('_')
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_')
             server_id = parts[2]
             bot_id = '_'.join(parts[3:])
             
@@ -540,12 +605,14 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             
             success, message = await control_bot(server_id, bot_id, 'start')
             
+            back_callback = cache_callback_data(f"bot_detail_{server_id}_{bot_id}")
+            
             if success:
                 await callback.message.edit_text(
                     f"✅ <b>Bot Started</b>\n\n{message}",
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=f"bot_detail_{server_id}_{bot_id}")
+                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=back_callback)
                     )
                 )
             else:
@@ -553,7 +620,7 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                     f"❌ <b>Failed to Start Bot</b>\n\n{message}",
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=f"bot_detail_{server_id}_{bot_id}")
+                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=back_callback)
                     )
                 )
                 
@@ -561,11 +628,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Bot start error: {e}")
             await callback.message.edit_text("❌ Error starting bot.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("bot_stop_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_stop_") or get_cached_callback_data(c.data).startswith("bot_stop_"))
     async def bot_stop(callback: types.CallbackQuery):
         """Stop a bot"""
         try:
-            parts = callback.data.split('_')
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_')
             server_id = parts[2]
             bot_id = '_'.join(parts[3:])
             
@@ -573,12 +642,14 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             
             success, message = await control_bot(server_id, bot_id, 'stop')
             
+            back_callback = cache_callback_data(f"bot_detail_{server_id}_{bot_id}")
+            
             if success:
                 await callback.message.edit_text(
                     f"✅ <b>Bot Stopped</b>\n\n{message}",
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=f"bot_detail_{server_id}_{bot_id}")
+                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=back_callback)
                     )
                 )
             else:
@@ -586,7 +657,7 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                     f"❌ <b>Failed to Stop Bot</b>\n\n{message}",
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=f"bot_detail_{server_id}_{bot_id}")
+                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=back_callback)
                     )
                 )
                 
@@ -594,11 +665,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Bot stop error: {e}")
             await callback.message.edit_text("❌ Error stopping bot.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("bot_restart_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_restart_") or get_cached_callback_data(c.data).startswith("bot_restart_"))
     async def bot_restart(callback: types.CallbackQuery):
         """Restart a bot"""
         try:
-            parts = callback.data.split('_')
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_')
             server_id = parts[2]
             bot_id = '_'.join(parts[3:])
             
@@ -606,12 +679,14 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             
             success, message = await control_bot(server_id, bot_id, 'restart')
             
+            back_callback = cache_callback_data(f"bot_detail_{server_id}_{bot_id}")
+            
             if success:
                 await callback.message.edit_text(
                     f"✅ <b>Bot Restarted</b>\n\n{message}",
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=f"bot_detail_{server_id}_{bot_id}")
+                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=back_callback)
                     )
                 )
             else:
@@ -619,7 +694,7 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                     f"❌ <b>Failed to Restart Bot</b>\n\n{message}",
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=f"bot_detail_{server_id}_{bot_id}")
+                        InlineKeyboardButton("⬅️ Back to Bot", callback_data=back_callback)
                     )
                 )
                 
@@ -627,11 +702,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Bot restart error: {e}")
             await callback.message.edit_text("❌ Error restarting bot.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("bot_logs_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_logs_") or get_cached_callback_data(c.data).startswith("bot_logs_"))
     async def bot_logs(callback: types.CallbackQuery):
         """Show bot logs"""
         try:
-            parts = callback.data.split('_')
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_')
             server_id = parts[2]
             bot_id = '_'.join(parts[3:])
             
@@ -678,12 +755,14 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             if not logs.strip():
                 logs = "No logs available"
             
+            back_callback = cache_callback_data(f"bot_detail_{server_id}_{bot_id}")
+            
             await callback.message.edit_text(
                 f"📊 <b>Bot Logs</b>\n\n"
                 f"<code>{logs}</code>",
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("⬅️ Back to Bot", callback_data=f"bot_detail_{server_id}_{bot_id}")
+                    InlineKeyboardButton("⬅️ Back to Bot", callback_data=back_callback)
                 )
             )
             
@@ -691,11 +770,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Bot logs error: {e}")
             await callback.message.edit_text("❌ Error fetching logs.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("bot_remove_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_remove_") or get_cached_callback_data(c.data).startswith("bot_remove_"))
     async def bot_remove_confirm(callback: types.CallbackQuery):
         """Confirm bot removal"""
         try:
-            parts = callback.data.split('_')
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_')
             server_id = parts[2]
             bot_id = '_'.join(parts[3:])
             
@@ -711,10 +792,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                 await callback.message.edit_text("❌ Bot not found.")
                 return
             
+            confirm_callback = cache_callback_data(f"bot_remove_confirm_{server_id}_{bot_id}")
+            cancel_callback = cache_callback_data(f"bot_detail_{server_id}_{bot_id}")
+            
             kb = InlineKeyboardMarkup(row_width=2)
             kb.add(
-                InlineKeyboardButton("✅ Yes, Remove", callback_data=f"bot_remove_confirm_{server_id}_{bot_id}"),
-                InlineKeyboardButton("❌ Cancel", callback_data=f"bot_detail_{server_id}_{bot_id}")
+                InlineKeyboardButton("✅ Yes, Remove", callback_data=confirm_callback),
+                InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback)
             )
             
             await callback.message.edit_text(
@@ -731,21 +815,24 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Bot remove confirm error: {e}")
             await callback.message.edit_text("❌ Error confirming removal.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("bot_remove_confirm_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_remove_confirm_") or get_cached_callback_data(c.data).startswith("bot_remove_confirm_"))
     async def bot_remove_execute(callback: types.CallbackQuery):
         """Execute bot removal"""
         try:
-            parts = callback.data.split('_')
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_')
             server_id = parts[3]
             bot_id = '_'.join(parts[4:])
             
             if remove_managed_bot(server_id, bot_id):
+                back_callback = cache_callback_data(f"bot_manager_{server_id}")
                 await callback.message.edit_text(
                     "✅ <b>Bot Removed</b>\n\n"
                     "Bot has been removed from the manager.",
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup().add(
-                        InlineKeyboardButton("⬅️ Back to Bots", callback_data=f"bot_manager_{server_id}")
+                        InlineKeyboardButton("⬅️ Back to Bots", callback_data=back_callback)
                     )
                 )
             else:
@@ -755,25 +842,33 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Bot remove execute error: {e}")
             await callback.message.edit_text("❌ Error removing bot.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("bot_settings_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("bot_settings_") or get_cached_callback_data(c.data).startswith("bot_settings_"))
     async def bot_settings(callback: types.CallbackQuery):
         """Bot settings placeholder"""
-        parts = callback.data.split('_')
-        server_id = parts[2]
-        bot_id = '_'.join(parts[3:])
-        
-        await callback.message.edit_text(
-            "🚧 <b>Bot Settings</b>\n\n"
-            "This feature is coming soon!\n\n"
-            "You'll be able to:\n"
-            "• Edit bot configuration\n"
-            "• Set environment variables\n"
-            "• Configure auto-restart\n"
-            "• Set up monitoring",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup().add(
-                InlineKeyboardButton("⬅️ Back to Bot", callback_data=f"bot_detail_{server_id}_{bot_id}")
+        try:
+            # Get actual callback data
+            callback_data = get_cached_callback_data(callback.data)
+            parts = callback_data.split('_')
+            server_id = parts[2]
+            bot_id = '_'.join(parts[3:])
+            
+            back_callback = cache_callback_data(f"bot_detail_{server_id}_{bot_id}")
+            
+            await callback.message.edit_text(
+                "🚧 <b>Bot Settings</b>\n\n"
+                "This feature is coming soon!\n\n"
+                "You'll be able to:\n"
+                "• Edit bot configuration\n"
+                "• Set environment variables\n"
+                "• Configure auto-restart\n"
+                "• Set up monitoring",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("⬅️ Back to Bot", callback_data=back_callback)
+                )
             )
-        )
+        except Exception as e:
+            logger.error(f"Bot settings error: {e}")
+            await callback.message.edit_text("❌ Error loading settings.")
     
     logger.info("✅ Bot manager handlers initialized")
