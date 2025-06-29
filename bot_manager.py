@@ -6,7 +6,6 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 logger = logging.getLogger(__name__)
 
 # Bot management state
-bot_states = {}
 managed_bots = {}  # Store manually added bots: {server_id: [bot_list]}
 
 def init_bot_manager(dp, bot, active_sessions, user_input):
@@ -26,7 +25,7 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             ))
         
         kb.add(
-            InlineKeyboardButton("➕ Add Bot", callback_data=f"add_bot_{server_id}")       
+            InlineKeyboardButton("➕ Add Bot", callback_data=f"add_bot_menu_{server_id}")       
         )
         kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=f"server_{server_id}"))
         
@@ -60,16 +59,8 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
     
     async def get_ssh_session(server_id):
         """Get SSH session for server"""
-        from db import get_server_by_id
-        
-        server = await get_server_by_id(server_id)
-        if not server:
-            return None
-        
-        # Use the session from active_sessions if available
         if server_id in active_sessions:
             return active_sessions[server_id]
-        
         return None
     
     def get_managed_bots(server_id):
@@ -96,6 +87,116 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
         
         managed_bots[server_id] = [bot for bot in managed_bots[server_id] if bot['id'] != bot_id]
         return True
+    
+    async def discover_services(server_id, service_type):
+        """Discover services of specific type"""
+        try:
+            ssh = await get_ssh_session(server_id)
+            if not ssh:
+                return []
+            
+            services = []
+            
+            if service_type == 'systemd':
+                # Get all systemd services
+                stdin, stdout, stderr = ssh.exec_command("systemctl list-units --type=service --all --no-pager --no-legend")
+                output = stdout.read().decode().strip()
+                
+                for line in output.splitlines():
+                    if line.strip():
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            service_name = parts[0].replace('.service', '')
+                            status = 'running' if 'active' in parts[2] else 'stopped'
+                            
+                            services.append({
+                                'name': service_name,
+                                'status': status,
+                                'type': 'systemd'
+                            })
+            
+            elif service_type == 'docker':
+                # Get all Docker containers
+                stdin, stdout, stderr = ssh.exec_command("docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' 2>/dev/null")
+                output = stdout.read().decode().strip()
+                
+                for line in output.splitlines()[1:]:  # Skip header
+                    if line.strip():
+                        parts = line.split('\t')
+                        if len(parts) >= 3:
+                            container_name = parts[0]
+                            status = 'running' if 'Up' in parts[1] else 'stopped'
+                            image = parts[2]
+                            
+                            services.append({
+                                'name': container_name,
+                                'status': status,
+                                'type': 'docker',
+                                'image': image
+                            })
+            
+            elif service_type == 'pm2':
+                # Get all PM2 processes
+                stdin, stdout, stderr = ssh.exec_command("pm2 jlist 2>/dev/null")
+                output = stdout.read().decode().strip()
+                
+                if output and output != '[]':
+                    import json
+                    try:
+                        processes = json.loads(output)
+                        for proc in processes:
+                            services.append({
+                                'name': proc.get('name', 'unknown'),
+                                'status': 'running' if proc.get('pm2_env', {}).get('status') == 'online' else 'stopped',
+                                'type': 'pm2',
+                                'pid': proc.get('pid')
+                            })
+                    except:
+                        # Fallback to text parsing
+                        stdin, stdout, stderr = ssh.exec_command("pm2 list --no-color 2>/dev/null")
+                        output = stdout.read().decode().strip()
+                        
+                        for line in output.splitlines():
+                            if '│' in line and 'name' not in line.lower():
+                                parts = [p.strip() for p in line.split('│')]
+                                if len(parts) >= 4:
+                                    name = parts[1]
+                                    status = 'running' if 'online' in parts[3] else 'stopped'
+                                    
+                                    services.append({
+                                        'name': name,
+                                        'status': status,
+                                        'type': 'pm2'
+                                    })
+            
+            elif service_type == 'processes':
+                # Get running processes
+                stdin, stdout, stderr = ssh.exec_command("ps aux | grep -E '(python|node|npm|java|go)' | grep -v grep")
+                output = stdout.read().decode().strip()
+                
+                for line in output.splitlines():
+                    if line.strip():
+                        parts = line.split()
+                        if len(parts) >= 11:
+                            pid = parts[1]
+                            command = ' '.join(parts[10:])
+                            
+                            # Extract process name
+                            process_name = command.split()[0].split('/')[-1]
+                            
+                            services.append({
+                                'name': f"{process_name} (PID: {pid})",
+                                'status': 'running',
+                                'type': 'process',
+                                'pid': pid,
+                                'command': command
+                            })
+            
+            return services
+            
+        except Exception as e:
+            logger.error(f"Error discovering {service_type} services: {e}")
+            return []
     
     async def get_bot_details(server_id, bot_id):
         """Get detailed information about a managed bot"""
@@ -128,9 +229,9 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                         bot_info['status'] = 'running' if 'online' in output else 'stopped'
                         
                     elif bot_type == 'process':
-                        stdin, stdout, stderr = ssh.exec_command(f"ps aux | grep '{bot_name}' | grep -v grep | wc -l")
-                        count = stdout.read().decode().strip()
-                        bot_info['status'] = 'running' if int(count) > 0 else 'stopped'
+                        stdin, stdout, stderr = ssh.exec_command(f"ps -p {bot_info.get('pid', '0')} > /dev/null 2>&1 && echo 'running' || echo 'stopped'")
+                        status = stdout.read().decode().strip()
+                        bot_info['status'] = status
                     
                     return bot_info
             
@@ -187,16 +288,14 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                     
             elif bot_type == 'process':
                 if action == 'stop':
-                    stdin, stdout, stderr = ssh.exec_command(f"pkill -f '{bot_name}'")
+                    stdin, stdout, stderr = ssh.exec_command(f"kill {bot_info.get('pid', '0')}")
                 elif action == 'start':
-                    # For process type, we need the command to start
                     if 'command' in bot_info:
                         stdin, stdout, stderr = ssh.exec_command(f"nohup {bot_info['command']} > /dev/null 2>&1 &")
                     else:
                         return False, "No start command available for this process"
                 elif action == 'restart':
-                    # Stop then start
-                    stdin, stdout, stderr = ssh.exec_command(f"pkill -f '{bot_name}'")
+                    stdin, stdout, stderr = ssh.exec_command(f"kill {bot_info.get('pid', '0')}")
                     await asyncio.sleep(2)
                     if 'command' in bot_info:
                         stdin, stdout, stderr = ssh.exec_command(f"nohup {bot_info['command']} > /dev/null 2>&1 &")
@@ -236,7 +335,7 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             
             if not bots:
                 kb = InlineKeyboardMarkup()
-                kb.add(InlineKeyboardButton("➕ Add Bot", callback_data=f"add_bot_{server_id}"))
+                kb.add(InlineKeyboardButton("➕ Add Bot", callback_data=f"add_bot_menu_{server_id}"))
                 kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=f"server_{server_id}"))
                 
                 await callback.message.edit_text(
@@ -269,26 +368,26 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Bot manager menu error: {e}")
             await callback.message.edit_text("❌ Error loading bot manager.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("add_bot_"))
+    @dp.callback_query_handler(lambda c: c.data.startswith("add_bot_menu_"))
     async def add_bot_menu(callback: types.CallbackQuery):
         """Show add bot menu"""
         try:
-            server_id = callback.data.split('_')[2]
+            server_id = callback.data.split('_')[3]
             
             kb = InlineKeyboardMarkup(row_width=2)
             kb.add(
-                InlineKeyboardButton("🔧 Systemd Service", callback_data=f"add_systemd_{server_id}"),
-                InlineKeyboardButton("🐳 Docker Container", callback_data=f"add_docker_{server_id}")
+                InlineKeyboardButton("🔧 Systemd Services", callback_data=f"discover_systemd_{server_id}"),
+                InlineKeyboardButton("🐳 Docker Containers", callback_data=f"discover_docker_{server_id}")
             )
             kb.add(
-                InlineKeyboardButton("📦 PM2 Process", callback_data=f"add_pm2_{server_id}"),
-                InlineKeyboardButton("⚙️ Custom Process", callback_data=f"add_process_{server_id}")
+                InlineKeyboardButton("📦 PM2 Processes", callback_data=f"discover_pm2_{server_id}"),
+                InlineKeyboardButton("⚙️ Running Processes", callback_data=f"discover_processes_{server_id}")
             )
             kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"bot_manager_{server_id}"))
             
             await callback.message.edit_text(
                 "➕ <b>Add Bot</b>\n\n"
-                "Choose the type of bot to add:",
+                "Choose service type to discover:",
                 parse_mode='HTML',
                 reply_markup=kb
             )
@@ -297,200 +396,98 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             logger.error(f"Add bot menu error: {e}")
             await callback.message.edit_text("❌ Error loading add bot menu.")
     
-    @dp.callback_query_handler(lambda c: c.data.startswith("add_systemd_"))
-    async def add_systemd_bot(callback: types.CallbackQuery):
-        """Add systemd service bot"""
+    @dp.callback_query_handler(lambda c: c.data.startswith("discover_"))
+    async def discover_services_handler(callback: types.CallbackQuery):
+        """Discover and show services"""
         try:
-            server_id = callback.data.split('_')[2]
-            user_id = callback.from_user.id
+            parts = callback.data.split('_')
+            service_type = parts[1]
+            server_id = parts[2]
             
-            user_input[user_id] = {
-                'action': 'add_bot',
-                'server_id': server_id,
-                'bot_type': 'systemd',
-                'step': 'name'
-            }
+            await callback.message.edit_text(f"🔄 <b>Discovering {service_type} services...</b>", parse_mode='HTML')
             
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"add_bot_{server_id}"))
+            services = await discover_services(server_id, service_type)
             
-            await bot.send_message(
-                user_id,
-                "🔧 <b>Add Systemd Service</b>\n\n"
-                "Enter the service name (without .service extension):\n"
-                "Example: <code>mybot</code>",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
-            
-        except Exception as e:
-            logger.error(f"Add systemd bot error: {e}")
-            await callback.message.edit_text("❌ Error adding systemd bot.")
-    
-    @dp.callback_query_handler(lambda c: c.data.startswith("add_docker_"))
-    async def add_docker_bot(callback: types.CallbackQuery):
-        """Add docker container bot"""
-        try:
-            server_id = callback.data.split('_')[2]
-            user_id = callback.from_user.id
-            
-            user_input[user_id] = {
-                'action': 'add_bot',
-                'server_id': server_id,
-                'bot_type': 'docker',
-                'step': 'name'
-            }
-            
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"add_bot_{server_id}"))
-            
-            await bot.send_message(
-                user_id,
-                "🐳 <b>Add Docker Container</b>\n\n"
-                "Enter the container name:\n"
-                "Example: <code>my-bot-container</code>",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
-            
-        except Exception as e:
-            logger.error(f"Add docker bot error: {e}")
-            await callback.message.edit_text("❌ Error adding docker bot.")
-    
-    @dp.callback_query_handler(lambda c: c.data.startswith("add_pm2_"))
-    async def add_pm2_bot(callback: types.CallbackQuery):
-        """Add PM2 process bot"""
-        try:
-            server_id = callback.data.split('_')[2]
-            user_id = callback.from_user.id
-            
-            user_input[user_id] = {
-                'action': 'add_bot',
-                'server_id': server_id,
-                'bot_type': 'pm2',
-                'step': 'name'
-            }
-            
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"add_bot_{server_id}"))
-            
-            await bot.send_message(
-                user_id,
-                "📦 <b>Add PM2 Process</b>\n\n"
-                "Enter the PM2 process name:\n"
-                "Example: <code>my-bot</code>",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
-            
-        except Exception as e:
-            logger.error(f"Add PM2 bot error: {e}")
-            await callback.message.edit_text("❌ Error adding PM2 bot.")
-    
-    @dp.callback_query_handler(lambda c: c.data.startswith("add_process_"))
-    async def add_process_bot(callback: types.CallbackQuery):
-        """Add custom process bot"""
-        try:
-            server_id = callback.data.split('_')[2]
-            user_id = callback.from_user.id
-            
-            user_input[user_id] = {
-                'action': 'add_bot',
-                'server_id': server_id,
-                'bot_type': 'process',
-                'step': 'name'
-            }
-            
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("❌ Cancel", callback_data=f"add_bot_{server_id}"))
-            
-            await bot.send_message(
-                user_id,
-                "⚙️ <b>Add Custom Process</b>\n\n"
-                "Enter a name for this bot:\n"
-                "Example: <code>My Python Bot</code>",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
-            
-        except Exception as e:
-            logger.error(f"Add process bot error: {e}")
-            await callback.message.edit_text("❌ Error adding process bot.")
-    
-    @dp.message_handler(lambda message: message.from_user.id in user_input and user_input[message.from_user.id].get('action') == 'add_bot')
-    async def handle_add_bot_input(message: types.Message):
-        """Handle add bot input"""
-        try:
-            user_id = message.from_user.id
-            data = user_input[user_id]
-            server_id = data['server_id']
-            bot_type = data['bot_type']
-            step = data['step']
-            
-            if step == 'name':
-                data['bot_name'] = message.text.strip()
+            if not services:
+                kb = InlineKeyboardMarkup()
+                kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"add_bot_menu_{server_id}"))
                 
-                if bot_type == 'process':
-                    data['step'] = 'command'
-                    await message.answer(
-                        "⚙️ <b>Custom Process Command</b>\n\n"
-                        "Enter the command to start this process:\n"
-                        "Example: <code>python3 /path/to/bot.py</code>",
-                        parse_mode='HTML'
-                    )
-                    return
-                else:
-                    # For other types, we can add directly
-                    await add_bot_to_manager(message, data)
-                    
-            elif step == 'command':
-                data['command'] = message.text.strip()
-                await add_bot_to_manager(message, data)
+                await callback.message.edit_text(
+                    f"❌ <b>No {service_type} services found</b>\n\n"
+                    f"No running {service_type} services were discovered on this server.",
+                    parse_mode='HTML',
+                    reply_markup=kb
+                )
+                return
+            
+            # Create selection keyboard
+            kb = InlineKeyboardMarkup(row_width=1)
+            
+            for service in services[:20]:  # Limit to 20 services
+                status_icon = "🟢" if service['status'] == 'running' else "🔴"
+                display_name = service['name'][:30] + "..." if len(service['name']) > 30 else service['name']
                 
+                kb.add(InlineKeyboardButton(
+                    f"{status_icon} {display_name}",
+                    callback_data=f"select_service_{server_id}_{service_type}_{service['name']}"
+                ))
+            
+            kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"add_bot_menu_{server_id}"))
+            
+            await callback.message.edit_text(
+                f"🔍 <b>Found {len(services)} {service_type} service(s)</b>\n\n"
+                f"Select a service to add to bot manager:",
+                parse_mode='HTML',
+                reply_markup=kb
+            )
+            
         except Exception as e:
-            logger.error(f"Handle add bot input error: {e}")
-            await message.answer("❌ Error processing input.")
+            logger.error(f"Discover services error: {e}")
+            await callback.message.edit_text("❌ Error discovering services.")
     
-    async def add_bot_to_manager(message, data):
-        """Add bot to manager"""
+    @dp.callback_query_handler(lambda c: c.data.startswith("select_service_"))
+    async def select_service_handler(callback: types.CallbackQuery):
+        """Handle service selection"""
         try:
-            server_id = data['server_id']
-            bot_type = data['bot_type']
-            bot_name = data['bot_name']
+            parts = callback.data.split('_', 4)
+            server_id = parts[2]
+            service_type = parts[3]
+            service_name = parts[4]
             
             # Create bot info
             bot_info = {
-                'id': f"{bot_type}_{bot_name}",
-                'name': bot_name,
-                'type': bot_type,
-                'status': 'stopped'
+                'id': f"{service_type}_{service_name}",
+                'name': service_name,
+                'type': service_type,
+                'status': 'unknown'
             }
-            
-            if 'command' in data:
-                bot_info['command'] = data['command']
             
             # Add to managed bots
             if add_managed_bot(server_id, bot_info):
-                await message.answer(
+                await callback.message.edit_text(
                     f"✅ <b>Bot Added Successfully!</b>\n\n"
-                    f"Name: <b>{bot_name}</b>\n"
-                    f"Type: <b>{bot_type}</b>\n\n"
+                    f"Name: <b>{service_name}</b>\n"
+                    f"Type: <b>{service_type}</b>\n\n"
                     f"You can now manage this bot from the Bot Manager.",
                     parse_mode='HTML'
                 )
+                
+                # Return to bot manager after 2 seconds
+                await asyncio.sleep(2)
+                await bot_manager_menu(callback)
             else:
-                await message.answer("❌ Bot with this name already exists.")
-            
-            user_input.pop(message.from_user.id, None)
-            
-            # Return to bot manager
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🤖 Bot Manager", callback_data=f"bot_manager_{server_id}"))
-            await message.answer("Choose an option:", reply_markup=kb)
+                await callback.message.edit_text(
+                    "❌ <b>Bot Already Exists</b>\n\n"
+                    "This service is already being managed.",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup().add(
+                        InlineKeyboardButton("⬅️ Back", callback_data=f"bot_manager_{server_id}")
+                    )
+                )
             
         except Exception as e:
-            logger.error(f"Add bot to manager error: {e}")
-            await message.answer("❌ Error adding bot.")
+            logger.error(f"Select service error: {e}")
+            await callback.message.edit_text("❌ Error adding service.")
     
     @dp.callback_query_handler(lambda c: c.data.startswith("bot_detail_"))
     async def bot_detail_menu(callback: types.CallbackQuery):
