@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
 
 # --- UTILS ---
 
