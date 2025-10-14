@@ -3,8 +3,11 @@ import io
 import paramiko
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
+# --- REMOVED: from aiogram.contrib.middlewares.logging import LoggingMiddleware ---
 from aiogram.utils import executor
+# --- ADDED IMPORT ---
+from aiogram.utils.exceptions import MessageNotModified
+# --------------------
 from config import BOT_TOKEN
 from db import (
     add_server,
@@ -26,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
+# dp.middleware.setup(LoggingMiddleware())  # <-- CLUTTER REMOVED HERE
 
 # --- UTILS ---
 
@@ -315,7 +319,11 @@ async def start_command(message: types.Message):
 async def back_to_start(callback: types.CallbackQuery):
     """Return to main menu"""
     try:
-        await callback.message.delete()
+        # Use try-except to prevent MessageNotModified errors when the start menu is already visible
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
         await start_command(callback.message)
         
     except Exception as e:
@@ -326,7 +334,11 @@ async def back_to_start(callback: types.CallbackQuery):
 async def cancel_action(callback: types.CallbackQuery):
     """Cancel current action"""
     user_input.pop(callback.from_user.id, None)
-    await callback.message.delete()
+    # Use try-except to prevent MessageNotModified errors
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     await start_command(callback.message)
 
 # --- SERVER MANAGEMENT ---
@@ -508,7 +520,11 @@ async def view_server(callback: types.CallbackQuery):
             f"Choose an option:"
         )
         
-        await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
+        # Use try-except to prevent MessageNotModified errors
+        try:
+            await callback.message.edit_text(text, parse_mode='HTML', reply_markup=kb)
+        except MessageNotModified:
+            pass
         
     except Exception as e:
         logger.error(f"View server error: {e}")
@@ -559,11 +575,15 @@ async def server_info(callback: types.CallbackQuery):
                 f"🔥 CPU Usage: {stats['cpu_usage']}%"
             )
         
-        await callback.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=back_button(f"server_{server_id}")
-        )
+        # Use try-except to prevent MessageNotModified errors
+        try:
+            await callback.message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=back_button(f"server_{server_id}")
+            )
+        except MessageNotModified:
+            pass
         
     except Exception as e:
         logger.error(f"Server info error: {e}")
@@ -593,12 +613,16 @@ async def edit_server(callback: types.CallbackQuery):
         )
         kb.add(InlineKeyboardButton("⬅️ Back", callback_data=f"server_{server_id}"))
         
-        await callback.message.edit_text(
-            f"⚙️ <b>Server Settings</b>\n\n"
-            f"Managing: <b>{server['name']}</b>",
-            parse_mode='HTML',
-            reply_markup=kb
-        )
+        # Use try-except to prevent MessageNotModified errors
+        try:
+            await callback.message.edit_text(
+                f"⚙️ <b>Server Settings</b>\n\n"
+                f"Managing: <b>{server['name']}</b>",
+                parse_mode='HTML',
+                reply_markup=kb
+            )
+        except MessageNotModified:
+            pass
         
     except Exception as e:
         logger.error(f"Edit server error: {e}")
@@ -626,13 +650,17 @@ async def reconnect_server(callback: types.CallbackQuery):
             # Create new session
             get_ssh_session(server_id, server['ip'], server['username'], server['key_content'])
             
-            await callback.message.edit_text(
-                f"✅ <b>Reconnected Successfully!</b>\n\n"
-                f"Server: {server['name']}\n"
-                f"IP: {server['ip']}",
-                parse_mode='HTML',
-                reply_markup=back_button(f"edit_{server_id}")
-            )
+            # Use try-except to prevent MessageNotModified errors
+            try:
+                await callback.message.edit_text(
+                    f"✅ <b>Reconnected Successfully!</b>\n\n"
+                    f"Server: {server['name']}\n"
+                    f"IP: {server['ip']}",
+                    parse_mode='HTML',
+                    reply_markup=back_button(f"edit_{server_id}")
+                )
+            except MessageNotModified:
+                pass
             
         except Exception as e:
             await callback.message.edit_text(
@@ -705,14 +733,18 @@ async def confirm_delete_server(callback: types.CallbackQuery):
             InlineKeyboardButton("❌ Cancel", callback_data=f"edit_{server_id}")
         )
         
-        await callback.message.edit_text(
-            f"⚠️ <b>Confirm Deletion</b>\n\n"
-            f"Are you sure you want to delete server:\n"
-            f"<b>{server['name']}</b> ({server['ip']})\n\n"
-            f"<b>This action cannot be undone!</b>",
-            parse_mode='HTML',
-            reply_markup=kb
-        )
+        # Use try-except to prevent MessageNotModified errors
+        try:
+            await callback.message.edit_text(
+                f"⚠️ <b>Confirm Deletion</b>\n\n"
+                f"Are you sure you want to delete server:\n"
+                f"<b>{server['name']}</b> ({server['ip']})\n\n"
+                f"<b>This action cannot be undone!</b>",
+                parse_mode='HTML',
+                reply_markup=kb
+            )
+        except MessageNotModified:
+            pass
         
     except Exception as e:
         logger.error(f"Confirm delete error: {e}")
