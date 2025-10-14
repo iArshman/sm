@@ -51,10 +51,17 @@ def init_deployment(dp, bot, active_sessions, user_input):
     async def deploy_handler(callback: types.CallbackQuery):
         """Main deployment menu"""
         try:
-            # Get actual callback data
+            # 1. Standardize Server ID Extraction (Fix for the unhandled callbacks)
             callback_data = get_cached_callback_data(callback.data)
-            server_id = callback_data.split('_')[1]
             
+            # Assuming format is "deploy_SERVER_ID" or "deploy_ACTION_SERVER_ID"
+            # We must handle the original server menu call: "deploy_bot_SERVER_ID" (from main.py)
+            parts = callback_data.split('_')
+            
+            # The server ID should always be the last part of the callback if we use the cache
+            server_id = parts[-1] 
+            
+            # 2. Fix Callback Generation (Ensuring no 'upload', 'github', 'docker' IDs are created)
             github_callback = cache_callback_data(f"deploy_github_{server_id}")
             docker_callback = cache_callback_data(f"deploy_docker_{server_id}")
             upload_callback = cache_callback_data(f"deploy_upload_{server_id}")
@@ -85,9 +92,9 @@ def init_deployment(dp, bot, active_sessions, user_input):
     async def deploy_github_handler(callback: types.CallbackQuery):
         """Start GitHub deployment"""
         try:
-            # Get actual callback data
+            # Fix: Use robust extraction
             callback_data = get_cached_callback_data(callback.data)
-            server_id = callback_data.split('_')[2]
+            server_id = callback_data.split('_')[-1]
             
             deployment_states[callback.from_user.id] = {
                 'type': 'github',
@@ -122,9 +129,9 @@ def init_deployment(dp, bot, active_sessions, user_input):
     async def deploy_docker_handler(callback: types.CallbackQuery):
         """Start Docker deployment"""
         try:
-            # Get actual callback data
+            # Fix: Use robust extraction
             callback_data = get_cached_callback_data(callback.data)
-            server_id = callback_data.split('_')[2]
+            server_id = callback_data.split('_')[-1]
             
             deployment_states[callback.from_user.id] = {
                 'type': 'docker',
@@ -161,9 +168,9 @@ def init_deployment(dp, bot, active_sessions, user_input):
     async def deploy_upload_handler(callback: types.CallbackQuery):
         """Start upload deployment"""
         try:
-            # Get actual callback data
+            # Fix: Use robust extraction
             callback_data = get_cached_callback_data(callback.data)
-            server_id = callback_data.split('_')[2]
+            server_id = callback_data.split('_')[-1]
             
             deployment_states[callback.from_user.id] = {
                 'type': 'upload',
@@ -194,7 +201,7 @@ def init_deployment(dp, bot, active_sessions, user_input):
         except Exception as e:
             logger.error(f"Upload deploy error: {e}")
             await callback.message.edit_text("❌ Error starting upload deployment.")
-    
+            
     # --- DEPLOYMENT MESSAGE HANDLER ---
     
     @dp.message_handler(lambda message: message.from_user.id in deployment_states)
