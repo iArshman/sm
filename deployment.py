@@ -7,6 +7,9 @@ import tarfile
 import asyncio
 import re
 import hashlib
+# --- ADDED IMPORT ---
+from aiogram.utils.exceptions import MessageNotModified
+# --------------------
 from datetime import datetime
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -51,17 +54,11 @@ def init_deployment(dp, bot, active_sessions, user_input):
     async def deploy_handler(callback: types.CallbackQuery):
         """Main deployment menu"""
         try:
-            # 1. Standardize Server ID Extraction (Fix for the unhandled callbacks)
             callback_data = get_cached_callback_data(callback.data)
             
-            # Assuming format is "deploy_SERVER_ID" or "deploy_ACTION_SERVER_ID"
-            # We must handle the original server menu call: "deploy_bot_SERVER_ID" (from main.py)
-            parts = callback_data.split('_')
+            # Robustly extract server_id, assuming it's the last part
+            server_id = callback_data.split('_')[-1] 
             
-            # The server ID should always be the last part of the callback if we use the cache
-            server_id = parts[-1] 
-            
-            # 2. Fix Callback Generation (Ensuring no 'upload', 'github', 'docker' IDs are created)
             github_callback = cache_callback_data(f"deploy_github_{server_id}")
             docker_callback = cache_callback_data(f"deploy_docker_{server_id}")
             upload_callback = cache_callback_data(f"deploy_upload_{server_id}")
@@ -75,12 +72,17 @@ def init_deployment(dp, bot, active_sessions, user_input):
             )
             kb.add(InlineKeyboardButton("⬅️ Back to Server", callback_data=back_callback))
             
-            await callback.message.edit_text(
-                "🚀 <b>Deployment Center</b>\n\n"
-                "Choose your deployment method:",
-                parse_mode='HTML',
-                reply_markup=kb
-            )
+            # --- FIX: MessageNotModified Error Handling ---
+            try:
+                await callback.message.edit_text(
+                    "🚀 <b>Deployment Center</b>\n\n"
+                    "Choose your deployment method:",
+                    parse_mode='HTML',
+                    reply_markup=kb
+                )
+            except MessageNotModified:
+                pass  # Ignore the user clicking the same menu button repeatedly
+            # ---------------------------------------------
             
         except Exception as e:
             logger.error(f"Deploy handler error: {e}")
@@ -92,9 +94,8 @@ def init_deployment(dp, bot, active_sessions, user_input):
     async def deploy_github_handler(callback: types.CallbackQuery):
         """Start GitHub deployment"""
         try:
-            # Fix: Use robust extraction
             callback_data = get_cached_callback_data(callback.data)
-            server_id = callback_data.split('_')[-1]
+            server_id = callback_data.split('_')[-1] # Robust extraction
             
             deployment_states[callback.from_user.id] = {
                 'type': 'github',
@@ -129,9 +130,8 @@ def init_deployment(dp, bot, active_sessions, user_input):
     async def deploy_docker_handler(callback: types.CallbackQuery):
         """Start Docker deployment"""
         try:
-            # Fix: Use robust extraction
             callback_data = get_cached_callback_data(callback.data)
-            server_id = callback_data.split('_')[-1]
+            server_id = callback_data.split('_')[-1] # Robust extraction
             
             deployment_states[callback.from_user.id] = {
                 'type': 'docker',
@@ -168,9 +168,8 @@ def init_deployment(dp, bot, active_sessions, user_input):
     async def deploy_upload_handler(callback: types.CallbackQuery):
         """Start upload deployment"""
         try:
-            # Fix: Use robust extraction
             callback_data = get_cached_callback_data(callback.data)
-            server_id = callback_data.split('_')[-1]
+            server_id = callback_data.split('_')[-1] # Robust extraction
             
             deployment_states[callback.from_user.id] = {
                 'type': 'upload',
@@ -201,8 +200,8 @@ def init_deployment(dp, bot, active_sessions, user_input):
         except Exception as e:
             logger.error(f"Upload deploy error: {e}")
             await callback.message.edit_text("❌ Error starting upload deployment.")
-            
-    # --- DEPLOYMENT MESSAGE HANDLER ---
+    
+    # --- Remaining Handlers (Unchanged) ---
     
     @dp.message_handler(lambda message: message.from_user.id in deployment_states)
     async def handle_deployment_input(message: types.Message):
@@ -686,7 +685,11 @@ def init_deployment(dp, bot, active_sessions, user_input):
                 InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback)
             )
             
-            await callback.message.edit_text(result_text, parse_mode='HTML', reply_markup=kb)
+            # Use try-except for menu updates to prevent MessageNotModified errors
+            try:
+                await callback.message.edit_text(result_text, parse_mode='HTML', reply_markup=kb)
+            except MessageNotModified:
+                pass
             
         except Exception as e:
             logger.error(f"Install deps error: {e}")
@@ -796,7 +799,11 @@ WantedBy=multi-user.target
                 )
             kb.add(InlineKeyboardButton("✅ Done", callback_data=complete_callback))
             
-            await callback.message.edit_text(result_text, parse_mode='HTML', reply_markup=kb)
+            # Use try-except for menu updates to prevent MessageNotModified errors
+            try:
+                await callback.message.edit_text(result_text, parse_mode='HTML', reply_markup=kb)
+            except MessageNotModified:
+                pass
             
         except Exception as e:
             logger.error(f"Configure service error: {e}")
@@ -898,7 +905,11 @@ WantedBy=multi-user.target
             kb = InlineKeyboardMarkup()
             kb.add(InlineKeyboardButton("✅ Done", callback_data=complete_callback))
             
-            await callback.message.edit_text(result_text, parse_mode='HTML', reply_markup=kb)
+            # Use try-except for menu updates to prevent MessageNotModified errors
+            try:
+                await callback.message.edit_text(result_text, parse_mode='HTML', reply_markup=kb)
+            except MessageNotModified:
+                pass
             
         except Exception as e:
             logger.error(f"Docker deploy now error: {e}")
@@ -962,7 +973,11 @@ WantedBy=multi-user.target
             kb = InlineKeyboardMarkup()
             kb.add(InlineKeyboardButton("✅ Done", callback_data=complete_callback))
             
-            await callback.message.edit_text(instructions, parse_mode='HTML', reply_markup=kb)
+            # Use try-except for menu updates to prevent MessageNotModified errors
+            try:
+                await callback.message.edit_text(instructions, parse_mode='HTML', reply_markup=kb)
+            except MessageNotModified:
+                pass
             
         except Exception as e:
             logger.error(f"Manual setup error: {e}")
@@ -996,13 +1011,17 @@ WantedBy=multi-user.target
             
             back_callback = cache_callback_data(f"configure_service_{uid}")
             
-            await callback.message.edit_text(
-                f"📊 <b>Service Logs</b>\n\n<code>{logs}</code>",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("⬅️ Back", callback_data=back_callback)
+            # Use try-except for menu updates to prevent MessageNotModified errors
+            try:
+                await callback.message.edit_text(
+                    f"📊 <b>Service Logs</b>\n\n<code>{logs}</code>",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup().add(
+                        InlineKeyboardButton("⬅️ Back", callback_data=back_callback)
+                    )
                 )
-            )
+            except MessageNotModified:
+                pass
             
         except Exception as e:
             logger.error(f"View logs error: {e}")
@@ -1024,15 +1043,19 @@ WantedBy=multi-user.target
             
             server_callback = cache_callback_data(f"server_{server_id}")
             
-            await callback.message.edit_text(
-                "✅ <b>Deployment Complete!</b>\n\n"
-                "Your application has been deployed successfully.\n"
-                "You can now manage it through the Bot Manager or manually via SSH.",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("🖥️ Back to Server", callback_data=server_callback)
+            # Use try-except for menu updates to prevent MessageNotModified errors
+            try:
+                await callback.message.edit_text(
+                    "✅ <b>Deployment Complete!</b>\n\n"
+                    "Your application has been deployed successfully.\n"
+                    "You can now manage it through the Bot Manager or manually via SSH.",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup().add(
+                        InlineKeyboardButton("🖥️ Back to Server", callback_data=server_callback)
+                    )
                 )
-            )
+            except MessageNotModified:
+                pass
             
         except Exception as e:
             logger.error(f"Deployment complete error: {e}")
@@ -1054,14 +1077,18 @@ WantedBy=multi-user.target
             
             server_callback = cache_callback_data(f"server_{server_id}")
             
-            await callback.message.edit_text(
-                "❌ <b>Deployment Cancelled</b>\n\n"
-                "The deployment process has been cancelled.",
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup().add(
-                    InlineKeyboardButton("🖥️ Back to Server", callback_data=server_callback)
+            # Use try-except for menu updates to prevent MessageNotModified errors
+            try:
+                await callback.message.edit_text(
+                    "❌ <b>Deployment Cancelled</b>\n\n"
+                    "The deployment process has been cancelled.",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup().add(
+                        InlineKeyboardButton("🖥️ Back to Server", callback_data=server_callback)
+                    )
                 )
-            )
+            except MessageNotModified:
+                pass
             
         except Exception as e:
             logger.error(f"Cancel deploy error: {e}")
